@@ -296,6 +296,7 @@ async function speakToTwilio(session, text) {
         // Step 1: make the request — responseType:'stream' resolves as soon as
         // response headers arrive, before any body data flows
         let response;
+        let gpuSampleRate = 24000; // Kokoro native rate; overridden by X-Sample-Rate header
         try {
             response = await axios({
                 method:       'post',
@@ -305,10 +306,7 @@ async function speakToTwilio(session, text) {
                 responseType: 'stream',
                 timeout:      15000,
             });
-            // Read the actual sample rate from the GPU server response header.
-            // Kokoro outputs at 24kHz natively; if we assume 16kHz and downsample
-            // by 2x we get 12kHz content at 8kHz playback = distorted horror audio.
-            const gpuSampleRate = parseInt(response.headers['x-sample-rate'] || '24000', 10);
+            gpuSampleRate = parseInt(response.headers['x-sample-rate'] || '24000', 10);
             logger.info(`TTS response headers received — status: ${response.status}, sample_rate: ${gpuSampleRate}`, { callSid });
         } catch (err) {
             logger.error(`TTS axios error: ${err.message}`, { callSid });
