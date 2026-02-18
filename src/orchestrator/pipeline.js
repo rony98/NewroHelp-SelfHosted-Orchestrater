@@ -10,6 +10,10 @@ const logger                         = require('../utils/logger');
 const SENTENCE_RE = /[.!?]+(?:\s|$)/;
 const PCM_CHUNK   = 320;
 
+// Twilio sends 20ms mulaw chunks. VAD needs ~100ms of audio for reliable
+// speech detection. Accumulate 5 chunks (100ms) before each VAD call.
+const VAD_BATCH_CHUNKS = 5;
+
 const laravelClient = axios.create({
     baseURL: process.env.LARAVEL_API_URL,
     headers: { 'X-Internal-Secret': process.env.LARAVEL_API_SECRET },
@@ -140,9 +144,28 @@ async function initPipeline(session, mediaStreamWs, pipelineConfig) {
 function handleIncomingAudio(session, mulawBase64) {
     if (session.status !== 'active') return;
 
+    // Decode and convert this chunk
     const mulawBuf = Buffer.from(mulawBase64, 'base64');
     const pcm16Buf = twilioMulawToPcm16(mulawBuf);
-    const audioB64 = pcm16ToBase64Wav(pcm16Buf);
+
+    // Always accumulate into speech buffer when speaking (before VAD fires)
+    // so we don't lose audio during the batching window
+    if (session.isSpeaking) {
+        session.appendSpeechBuffer(pcm16Buf);
+    }
+
+    // Accumulate chunks for VAD batching
+    if (!session.vadAccumulator) session.vadAccumulator = [];
+    session.vadAccumulator.push(pcm16Buf);
+
+    // Only call VAD once we have enough audio (100ms = 5 x 20ms chunks)
+    if (session.vadAccumulator.length < VAD_BATCH_CHUNKS) return;
+
+    // Grab the batch and reset accumulator immediately so next chunks start fresh
+    const batch     = session.vadAccumulator;
+    session.vadAccumulator = [];
+    const batchBuf  = Buffer.concat(batch);
+    const audioB64  = pcm16ToBase64Wav(batchBuf);
 
     gpuClient.detectVAD(audioB64, session.callSid).then(async (vadResult) => {
         if (session.status !== 'active') return;
@@ -153,13 +176,21 @@ function handleIncomingAudio(session, mulawBase64) {
             session.isSpeaking = true;
             session.clearSilenceTimer();
             if (session.isAISpeaking) interruptAI(session);
-            session.appendSpeechBuffer(pcm16Buf);
+            // batchBuf already covers these chunks - add it to speech buffer
+            if (!session.isSpeakingBuffered) {
+                session.appendSpeechBuffer(batchBuf);
+                session.isSpeakingBuffered = true;
+            }
 
-        } else if (event === 'silence' && session.isSpeaking) {
-            session.appendSpeechBuffer(pcm16Buf);
+        } else if (event === 'silence') {
+            session.isSpeakingBuffered = false;
+            if (!session.isSpeaking) {
+                // True silence - nothing buffered
+            }
 
         } else if (event === 'speech_end') {
-            session.isSpeaking = false;
+            session.isSpeaking        = false;
+            session.isSpeakingBuffered = false;
             const speechAudio = session.flushSpeechBuffer();
             if (speechAudio.length > 0) await transcribeAndRespond(session, speechAudio);
             session.startSilenceTimer(() => endCall(session, 'no_response'));
@@ -200,34 +231,71 @@ async function speakToTwilio(session, text) {
     const { callSid } = session;
     session.isAISpeaking = true;
 
-    logger.info(`TTS called — voice: ${session.voice}, text: "${text.slice(0,50)}"`, { callSid });
-    logger.info(`TTS URL: ${process.env.GPU_SERVER_URL}/tts/synthesize`, { callSid });
-
     try {
-        const response = await axios({
-            method:       'post',
-            url:          `${process.env.GPU_SERVER_URL}/tts/synthesize`,
-            headers:      { 'X-API-Key': process.env.GPU_SERVER_API_KEY },
-            data:         { text, voice: session.voice, language: session.language, sample_rate: 16000, streaming: true },
-            responseType: 'stream',
-            timeout:      30000,
-        });
+        const ttsStart = Date.now();
 
+        // Step 1: make the request — responseType:'stream' resolves as soon as
+        // response headers arrive, before any body data flows
+        let response;
+        try {
+            response = await axios({
+                method:       'post',
+                url:          `${process.env.GPU_SERVER_URL}/tts/synthesize`,
+                headers:      { 'X-API-Key': process.env.GPU_SERVER_API_KEY },
+                data:         { text, voice: session.voice, language: session.language, sample_rate: 16000, streaming: true },
+                responseType: 'stream',
+                timeout:      15000,
+            });
+            logger.info(`TTS response headers received — status: ${response.status}`, { callSid });
+        } catch (err) {
+            logger.error(`TTS axios error: ${err.message}`, { callSid });
+            session.isAISpeaking = false;
+            return;
+        }
+
+        // Step 2: consume the stream
         await new Promise((resolve, reject) => {
-            let pcmBuffer = Buffer.alloc(0);
+            let pcmBuffer    = Buffer.alloc(0);
+            let bytesReceived = 0;
+
+            // Safety net: if stream goes silent for 10s, bail out
+            let streamTimer = setTimeout(() => {
+                logger.error(`TTS stream timeout after ${bytesReceived} bytes received`, { callSid });
+                response.data.destroy();
+                resolve(); // resolve not reject — partial audio is fine
+            }, 10000);
+
+            const done = (reason) => {
+                clearTimeout(streamTimer);
+                logger.info(`TTS stream ${reason} — ${bytesReceived} bytes, ${Date.now() - ttsStart}ms total`, { callSid });
+                resolve();
+            };
 
             response.data.on('data', (chunk) => {
-                if (session.status === 'ending' || session.status === 'ended' || !session.isAISpeaking) {
+                clearTimeout(streamTimer);
+                streamTimer = setTimeout(() => {
+                    logger.error(`TTS stream stalled mid-stream after ${bytesReceived} bytes`, { callSid });
                     response.data.destroy();
                     resolve();
+                }, 10000);
+
+                if (session.status === 'ending' || session.status === 'ended' || !session.isAISpeaking) {
+                    response.data.destroy();
+                    clearTimeout(streamTimer);
+                    resolve();
                     return;
+                }
+
+                bytesReceived += chunk.length;
+                if (bytesReceived === chunk.length) {
+                    logger.info(`TTS first chunk received — ${chunk.length} bytes, ${Date.now() - ttsStart}ms`, { callSid });
                 }
 
                 pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
 
                 while (pcmBuffer.length >= PCM_CHUNK) {
-                    const pcmSlice  = pcmBuffer.slice(0, PCM_CHUNK);
-                    pcmBuffer       = pcmBuffer.slice(PCM_CHUNK);
+                    const pcmSlice   = pcmBuffer.slice(0, PCM_CHUNK);
+                    pcmBuffer        = pcmBuffer.slice(PCM_CHUNK);
                     const mulawSlice = pcm16ToTwilioMulaw(pcmSlice);
 
                     if (session.mediaStreamWs?.readyState === 1) {
@@ -241,6 +309,7 @@ async function speakToTwilio(session, text) {
             });
 
             response.data.on('end', () => {
+                // Flush remaining bytes
                 if (pcmBuffer.length > 0 && session.mediaStreamWs?.readyState === 1) {
                     const mulawSlice = pcm16ToTwilioMulaw(pcmBuffer);
                     session.mediaStreamWs.send(JSON.stringify({
@@ -258,18 +327,19 @@ async function speakToTwilio(session, text) {
                     }));
                 }
 
-                resolve();
+                done('ended');
             });
 
             response.data.on('error', (err) => {
-                logger.error('TTS stream error', { callSid, error: err.message });
+                clearTimeout(streamTimer);
+                logger.error(`TTS stream error: ${err.message}`, { callSid });
                 session.isAISpeaking = false;
                 reject(err);
             });
         });
 
     } catch (err) {
-        logger.error('TTS failed', { callSid, error: err.message });
+        logger.error(`TTS failed: ${err.message}`, { callSid });
         session.isAISpeaking = false;
     }
 }
