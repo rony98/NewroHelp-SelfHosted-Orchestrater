@@ -1,0 +1,16 @@
+[Unit]
+Description=NewroHelp Main Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/NewroHelp-SelfHosted-Orchestrator
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/www/NewroHelp-SelfHosted-Orchestrator/logs/combined.log
+StandardError=append:/var/www/NewroHelp-SelfHosted-Orchestrator/logs/error.log
+
+[Install]
+WantedBy=multi-user.target

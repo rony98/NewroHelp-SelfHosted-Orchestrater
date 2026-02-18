@@ -1,0 +1,16 @@
+[Unit]
+Description=NewroHelp Main Server
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/newrohelp-main-server
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ubuntu/newrohelp-main-server/logs/combined.log
+StandardError=append:/home/ubuntu/newrohelp-main-server/logs/error.log
+
+[Install]
+WantedBy=multi-user.target
