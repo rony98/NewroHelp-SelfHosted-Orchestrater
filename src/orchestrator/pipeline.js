@@ -231,25 +231,27 @@ function handleIncomingAudio(session, mulawBase64) {
         const { event } = vadResult;
 
         if (event === 'speech_start') {
-            // Require INTERRUPT_THRESHOLD consecutive speech_start batches
-            // before treating it as real speech — filters breathing/noise.
             session.speechStartCount = (session.speechStartCount || 0) + 1;
 
-            if (session.speechStartCount >= INTERRUPT_THRESHOLD) {
-                if (!session.isSpeaking) {
-                    session.isSpeaking = true;
-                    session.clearSilenceTimer();
-                    if (session.isAISpeaking) interruptAI(session);
-                }
-                session.appendSpeechBuffer(batchBuf);
+            // Always buffer audio from the first detection so we don't lose speech
+            if (!session.isSpeaking) {
+                session.isSpeaking = true;
+                session.clearSilenceTimer();
+            }
+            session.appendSpeechBuffer(batchBuf);
+
+            // Only interrupt the AI after INTERRUPT_THRESHOLD consecutive detections
+            // — prevents breathing/noise from cutting off AI speech
+            if (session.speechStartCount >= INTERRUPT_THRESHOLD && session.isAISpeaking) {
+                interruptAI(session);
             }
 
         } else if (event === 'silence') {
             session.speechStartCount = 0;
 
         } else if (event === 'speech_end') {
-            session.speechStartCount  = 0;
-            session.isSpeaking        = false;
+            session.speechStartCount = 0;
+            session.isSpeaking       = false;
             const speechAudio = session.flushSpeechBuffer();
             if (speechAudio.length > 0) await transcribeAndRespond(session, speechAudio);
             session.startSilenceTimer(() => endCall(session, 'no_response'));
