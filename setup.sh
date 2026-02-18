@@ -84,7 +84,7 @@ echo "  ✓ Dependencies installed"
 # ----------------------------------------
 echo -e "${GREEN}[4/5] Setting up environment...${NC}"
 if [ ! -f ".env" ]; then
-    cp env.example.txt .env
+    cp env.example .env
     echo -e "${YELLOW}
   .env created from template.
   IMPORTANT: Edit .env before starting the server.
