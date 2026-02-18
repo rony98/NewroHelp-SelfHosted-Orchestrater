@@ -21,9 +21,13 @@ app.post('/api/internal/calls/incoming', (req, res) => {
     const { call_sid, caller_phone, to_phone } = req.body;
     console.log(`[incoming] ${caller_phone} → ${to_phone} (${call_sid})`);
 
+    // twilio_auth_token is returned here so twiml.js can validate
+    // the Twilio signature immediately after this call.
+    // In production Laravel looks this up via TwilioPhoneNumber → TwilioAccount.
     res.json({
-        assistant_id:    'mock-assistant-1',
-        organization_id: 'mock-org-1',
+        assistant_id:      'mock-assistant-1',
+        organization_id:   'mock-org-1',
+        twilio_auth_token: process.env.TWILIO_AUTH_TOKEN || 'your_twilio_auth_token',
     });
 });
 
