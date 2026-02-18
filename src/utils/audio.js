@@ -68,30 +68,56 @@ function twilioMulawToPcm16(mulawBuffer) {
 
 // ─── TTS → Twilio ────────────────────────────────────────────────────────────
 
+// ─── FIR low-pass filter for 24kHz → 8kHz downsampling ──────────────────────
+//
+// Windowed-sinc FIR, 31 taps, cutoff 3400Hz (just below 4kHz Nyquist).
+// Pre-computed with a Hann window for good stopband attenuation.
+// This prevents aliasing artifacts (static/muffling) that occur when
+// decimating without filtering — high frequencies fold back into the
+// audible band and distort the voice.
+const FIR_COEFFS = [
+    0.00000000, -0.00002594, -0.00088668, -0.00240630, -0.00171365,
+    0.00397438,  0.01205519,  0.01322405, -0.00131283, -0.02805956,
+    -0.04606746, -0.02698192,  0.04352085,  0.14877926,  0.24439398,
+    0.28301324,  0.24439398,  0.14877926,  0.04352085, -0.02698192,
+    -0.04606746, -0.02805956, -0.00131283,  0.01322405,  0.01205519,
+    0.00397438, -0.00171365, -0.00240630, -0.00088668, -0.00002594,
+    0.00000000,
+];
+const FIR_TAPS = FIR_COEFFS.length;   // 31
+const FIR_HALF = (FIR_TAPS - 1) >> 1; // 15
+
 /**
  * Convert PCM16 buffer (24kHz — Kokoro native) to Twilio mulaw buffer (8kHz).
  *
- * Naive decimation (take every 3rd sample) causes aliasing — high-frequency
- * content folds back into the audible range as static/muffling. Instead we
- * average each group of 3 samples before encoding, which acts as a simple
- * box low-pass filter and eliminates most aliasing artifacts.
+ * Applies a 31-tap windowed-sinc FIR low-pass filter before decimating 3:1.
+ * The filter removes frequencies above 3.4kHz so they can't alias back into
+ * the voice band when we drop from 24kHz to 8kHz.
  *
  * @param {Buffer} pcm16Buffer - PCM16 LE buffer at 24kHz
  * @returns {Buffer} - Raw mulaw bytes for Twilio at 8kHz
  */
 function pcm16ToTwilioMulaw(pcm16Buffer) {
     const samples = pcm16Buffer.length / 2;
-    const mulaw   = [];
 
-    for (let i = 0; i + 2 < samples; i += 3) {
-        // Average 3 consecutive samples (box filter) before decimating.
-        // This low-passes at ~4kHz (Nyquist of 8kHz output) and prevents
-        // high-frequency aliasing that sounds like static/muffling.
-        const s0  = pcm16Buffer.readInt16LE(i * 2);
-        const s1  = pcm16Buffer.readInt16LE((i + 1) * 2);
-        const s2  = pcm16Buffer.readInt16LE((i + 2) * 2);
-        const avg = Math.round((s0 + s1 + s2) / 3);
-        mulaw.push(mulawEncode(avg));
+    // Read all samples into a Float64 array for filter arithmetic
+    const pcm = new Float64Array(samples);
+    for (let i = 0; i < samples; i++) {
+        pcm[i] = pcm16Buffer.readInt16LE(i * 2);
+    }
+
+    const mulaw = [];
+
+    // Output one mulaw byte for every 3 input samples (24k→8k)
+    // At each output position, convolve the FIR kernel with the input
+    for (let i = 0; i < samples - FIR_TAPS; i += 3) {
+        let acc = 0;
+        for (let k = 0; k < FIR_TAPS; k++) {
+            acc += FIR_COEFFS[k] * pcm[i + k];
+        }
+        // Clamp to int16 range and encode as mulaw
+        const sample = Math.max(-32768, Math.min(32767, Math.round(acc)));
+        mulaw.push(mulawEncode(sample));
     }
 
     return Buffer.from(mulaw);
