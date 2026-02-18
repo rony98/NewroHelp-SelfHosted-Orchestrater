@@ -200,6 +200,9 @@ async function speakToTwilio(session, text) {
     const { callSid } = session;
     session.isAISpeaking = true;
 
+    logger.info(`TTS called — voice: ${session.voice}, text: "${text.slice(0,50)}"`, { callSid });
+    logger.info(`TTS URL: ${process.env.GPU_SERVER_URL}/tts/synthesize`, { callSid });
+
     try {
         const response = await axios({
             method:       'post',
