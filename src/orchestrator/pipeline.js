@@ -16,32 +16,7 @@ const PCM_CHUNK   = 320;
 const VAD_BATCH_CHUNKS    = 10;
 const INTERRUPT_THRESHOLD = 2;
 
-/**
- * Downsample PCM16 buffer from GPU sample rate to Twilio 8kHz mulaw.
- * Uses decimation (take every Nth sample) where N = gpuRate/8000.
- * Proper decimation ratio prevents pitch/speed distortion.
- */
-function pcm16ToMulawDecimate(pcm16Buffer, decimation) {
-    const totalSamples = Math.floor(pcm16Buffer.length / 2);
-    const mulaw = [];
-    for (let i = 0; i < totalSamples; i += decimation) {
-        const byteOffset = i * 2;
-        if (byteOffset + 1 >= pcm16Buffer.length) break;
-        const sample = pcm16Buffer.readInt16LE(byteOffset);
-        // mulaw encode inline
-        const MAX = 32767;
-        const BIAS = 0x84;
-        let s = sample;
-        const sign = s < 0 ? 0x80 : 0;
-        if (s < 0) s = -s;
-        if (s > MAX) s = MAX;
-        s += BIAS;
-        const exp = Math.floor(Math.log(s) / Math.log(2)) - 5;
-        const mantissa = (s >> (exp + 1)) & 0x0F;
-        mulaw.push((~(sign | (exp << 4) | mantissa)) & 0xFF);
-    }
-    return Buffer.from(mulaw);
-}
+
 
 const laravelClient = axios.create({
     baseURL: process.env.LARAVEL_API_URL,
@@ -298,18 +273,18 @@ async function speakToTwilio(session, text) {
         // Step 1: make the request — responseType:'stream' resolves as soon as
         // response headers arrive, before any body data flows
         let response;
-        let gpuSampleRate = 24000; // Kokoro native rate; overridden by X-Sample-Rate header
         try {
             response = await axios({
                 method:       'post',
                 url:          `${process.env.GPU_SERVER_URL}/tts/synthesize`,
                 headers:      { 'X-API-Key': process.env.GPU_SERVER_API_KEY },
-                data:         { text, voice: session.voice, language: session.language, sample_rate: 16000, streaming: true },
+                data:         { text, voice: session.voice, language: session.language, streaming: true },
                 responseType: 'stream',
                 timeout:      15000,
             });
-            gpuSampleRate = parseInt(response.headers['x-sample-rate'] || '24000', 10);
-            logger.info(`TTS response headers received — status: ${response.status}, sample_rate: ${gpuSampleRate}`, { callSid });
+            // GPU server resamples Kokoro 24kHz → 8kHz via soxr before streaming.
+            // X-Sample-Rate will always be 8000. Node.js just mulaw-encodes directly.
+            logger.info(`TTS response headers received — status: ${response.status}`, { callSid });
         } catch (err) {
             logger.error(`TTS axios error: ${err.message}`, { callSid });
             session.isAISpeaking = false;
@@ -320,10 +295,6 @@ async function speakToTwilio(session, text) {
         await new Promise((resolve, reject) => {
             let pcmBuffer    = Buffer.alloc(0);
             let bytesReceived = 0;
-            // Compute decimation factor: GPU sample rate → Twilio 8kHz
-            // e.g. 24000/8000 = 3 (take every 3rd sample)
-            //      16000/8000 = 2 (take every 2nd sample)
-            const decimation = Math.round(gpuSampleRate / 8000);
 
             // Safety net: if stream goes silent for 10s, bail out
             let streamTimer = setTimeout(() => {
@@ -364,12 +335,13 @@ async function speakToTwilio(session, text) {
 
                 pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
 
-                // PCM_CHUNK sized slices for processing, but use dynamic decimation
-                const minBytes = decimation * 2 * 160; // 160 output samples worth of input
-                while (pcmBuffer.length >= minBytes) {
-                    const inputSlice = pcmBuffer.slice(0, minBytes);
-                    pcmBuffer        = pcmBuffer.slice(minBytes);
-                    const mulawSlice = pcm16ToMulawDecimate(inputSlice, decimation);
+                // Send 160-sample (320 byte) chunks — 20ms at 8kHz
+                // 160 output samples at 8kHz = 320 bytes PCM16 = one 20ms Twilio chunk
+                const chunkBytes = 320;
+                while (pcmBuffer.length >= chunkBytes) {
+                    const inputSlice = pcmBuffer.slice(0, chunkBytes);
+                    pcmBuffer        = pcmBuffer.slice(chunkBytes);
+                    const mulawSlice = pcm16ToTwilioMulaw(inputSlice);
 
                     if (session.mediaStreamWs?.readyState === 1) {
                         session.mediaStreamWs.send(JSON.stringify({
@@ -384,7 +356,7 @@ async function speakToTwilio(session, text) {
             response.data.on('end', () => {
                 // Flush remaining bytes
                 if (pcmBuffer.length >= 2 && session.mediaStreamWs?.readyState === 1) {
-                    const mulawSlice = pcm16ToMulawDecimate(pcmBuffer, decimation);
+                    const mulawSlice = pcm16ToTwilioMulaw(pcmBuffer);
                     session.mediaStreamWs.send(JSON.stringify({
                         event:     'media',
                         streamSid: session.twilioStreamSid,
