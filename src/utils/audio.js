@@ -70,11 +70,11 @@ function twilioMulawToPcm16(mulawBuffer) {
 
 /**
  * Convert PCM16 buffer (24kHz — Kokoro native) to Twilio mulaw buffer (8kHz).
- * Downsample 24kHz → 8kHz by taking every 3rd sample (ratio 3:1).
  *
- * Kokoro outputs at 24000Hz natively. The GPU server streams raw PCM16 at
- * that rate with no resampling. Twilio expects 8000Hz mulaw.
- * 24000 / 8000 = 3, so we keep every 3rd sample.
+ * Naive decimation (take every 3rd sample) causes aliasing — high-frequency
+ * content folds back into the audible range as static/muffling. Instead we
+ * average each group of 3 samples before encoding, which acts as a simple
+ * box low-pass filter and eliminates most aliasing artifacts.
  *
  * @param {Buffer} pcm16Buffer - PCM16 LE buffer at 24kHz
  * @returns {Buffer} - Raw mulaw bytes for Twilio at 8kHz
@@ -83,9 +83,15 @@ function pcm16ToTwilioMulaw(pcm16Buffer) {
     const samples = pcm16Buffer.length / 2;
     const mulaw   = [];
 
-    for (let i = 0; i < samples; i += 3) {
-        const sample = pcm16Buffer.readInt16LE(i * 2);
-        mulaw.push(mulawEncode(sample));
+    for (let i = 0; i + 2 < samples; i += 3) {
+        // Average 3 consecutive samples (box filter) before decimating.
+        // This low-passes at ~4kHz (Nyquist of 8kHz output) and prevents
+        // high-frequency aliasing that sounds like static/muffling.
+        const s0  = pcm16Buffer.readInt16LE(i * 2);
+        const s1  = pcm16Buffer.readInt16LE((i + 1) * 2);
+        const s2  = pcm16Buffer.readInt16LE((i + 2) * 2);
+        const avg = Math.round((s0 + s1 + s2) / 3);
+        mulaw.push(mulawEncode(avg));
     }
 
     return Buffer.from(mulaw);
