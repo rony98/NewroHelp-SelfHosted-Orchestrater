@@ -32,6 +32,52 @@ async function initPipeline(session, mediaStreamWs, pipelineConfig) {
     const tools = buildTools(session.assistantConfig);
     logger.info(`Loaded ${tools.length} tools`, { callSid, tools: tools.map(t => t.name) });
 
+    // ── Attach message listener BEFORE connecting to OpenAI ──────────────────
+    // The Twilio 'start' event fires as soon as the WebSocket connects.
+    // If we wait until after openaiClient.connect() to attach the listener,
+    // the 'start' event arrives while we're awaiting and is silently dropped,
+    // leaving session.twilioStreamSid undefined and all outbound audio ignored.
+    //
+    // Solution: attach the listener now, buffer 'media' events until the
+    // pipeline is fully ready, then drain the buffer.
+    const mediaQueue = [];
+    let   pipelineReady = false;
+
+    mediaStreamWs.on('message', async (rawMsg) => {
+        let msg;
+        try { msg = JSON.parse(rawMsg); } catch { return; }
+
+        switch (msg.event) {
+            case 'start':
+                // Capture streamSid immediately — cannot be missed
+                session.twilioStreamSid = msg.start.streamSid;
+                logger.info('Stream started', { callSid, streamSid: session.twilioStreamSid });
+                break;
+
+            case 'media':
+                if (!pipelineReady) {
+                    mediaQueue.push(msg.media.payload);
+                } else {
+                    await handleIncomingAudio(session, msg.media.payload);
+                }
+                break;
+
+            case 'stop':
+                logger.info('Stream stopped', { callSid });
+                await cleanup(session, 'stream_stopped');
+                break;
+
+            case 'mark':
+                if (msg.mark?.name === 'ai_speech_end') session.isAISpeaking = false;
+                break;
+        }
+    });
+
+    mediaStreamWs.on('close', () => {
+        logger.info('Twilio WS closed', { callSid });
+        cleanup(session, 'ws_closed');
+    });
+
     const openaiClient = new OpenAIRealtimeClient(callSid, {
         systemPrompt: pipelineConfig.systemPrompt,
         tools,
@@ -105,38 +151,21 @@ async function initPipeline(session, mediaStreamWs, pipelineConfig) {
     session.startMaxDurationTimer(() => endCall(session, 'max_duration'));
     session.startSilenceTimer(() => endCall(session, 'no_response'));
 
-    mediaStreamWs.on('message', async (rawMsg) => {
-        let msg;
-        try { msg = JSON.parse(rawMsg); } catch { return; }
+    // ── Pipeline is ready — drain buffered media and speak first message ───────
+    pipelineReady = true;
 
-        switch (msg.event) {
-            case 'start':
-                session.twilioStreamSid = msg.start.streamSid;
-                logger.info('Stream started', { callSid, streamSid: session.twilioStreamSid });
-                if (session.assistantConfig.first_message) {
-                    await speakToTwilio(session, session.assistantConfig.first_message);
-                }
-                break;
+    if (session.assistantConfig.first_message) {
+        await speakToTwilio(session, session.assistantConfig.first_message);
+    }
 
-            case 'media':
-                await handleIncomingAudio(session, msg.media.payload);
-                break;
-
-            case 'stop':
-                logger.info('Stream stopped', { callSid });
-                await cleanup(session, 'stream_stopped');
-                break;
-
-            case 'mark':
-                if (msg.mark?.name === 'ai_speech_end') session.isAISpeaking = false;
-                break;
+    // Drain any media chunks that arrived while OpenAI was connecting
+    if (mediaQueue.length > 0) {
+        logger.info(`Draining ${mediaQueue.length} buffered audio chunks`, { callSid });
+        for (const payload of mediaQueue) {
+            await handleIncomingAudio(session, payload);
         }
-    });
-
-    mediaStreamWs.on('close', () => {
-        logger.info('Twilio WS closed', { callSid });
-        cleanup(session, 'ws_closed');
-    });
+        mediaQueue.length = 0;
+    }
 
     logger.info('Pipeline ready', { callSid });
 }
