@@ -83,9 +83,8 @@ router.post('/incoming', async (req, res) => {
         const wsUrl = `wss://${host}/twilio/stream/${callSid}`;
 
         const response = new twilio.twiml.VoiceResponse();
-        const start    = response.start();
-        start.stream({ url: wsUrl });
-        response.pause({ length: 60 });
+        const connect  = response.connect();
+        connect.stream({ url: wsUrl });
 
         logger.info('Responding with TwiML MediaStream', { callSid, wsUrl });
 
