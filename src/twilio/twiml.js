@@ -39,6 +39,11 @@ function validateTwilioSignature(req, authToken) {
     const url      = `${protocol}://${host}${req.originalUrl}`;
 
     try {
+        const callSid     = req.body.CallSid;
+        const callerPhone = req.body.From;
+        const toPhone     = req.body.To;
+
+        logger.info(`Signature validation successful for incoming call: ${callerPhone} → ${toPhone}`, { callSid });
         return twilio.validateRequest(authToken, signature, url, req.body);
     } catch (err) {
         logger.error(`Signature validation threw: ${err.message}`);
