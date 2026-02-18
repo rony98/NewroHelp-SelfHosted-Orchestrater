@@ -17,19 +17,14 @@ const laravelClient = axios.create({
 // ─────────────────────────────────────────────────────────────────────────────
 // Twilio Signature Validation
 //
-// Twilio signs every webhook request with HMAC-SHA1 using the account's
-// auth token. We fetch the auth token from Laravel's POST /calls/incoming
-// response (sourced from the twilio_accounts DB table), then validate.
-//
-// Why validate after calling Laravel instead of before?
-// - We have multiple Twilio accounts with different auth tokens in the DB.
-// - We need to know which account owns the `To` number before we can validate.
-// - The Laravel call is internal (localhost), so the risk of the pre-validation
-//   call is negligible — an attacker still gets a 403 either way.
+// Only runs when TWILIO_VALIDATE_SIGNATURES=true in .env AND the Laravel
+// /calls/incoming response includes twilio_auth_token. Safe to enable once
+// Laravel is updated to return the token.
 // ─────────────────────────────────────────────────────────────────────────────
 function validateTwilioSignature(req, authToken) {
-    // Skip validation in development
-    if (process.env.NODE_ENV !== 'production') {
+    if (process.env.TWILIO_VALIDATE_SIGNATURES !== 'true') return true;
+    if (!authToken) {
+        logger.warn('Signature validation enabled but no auth token returned by Laravel — skipping');
         return true;
     }
 
@@ -39,12 +34,16 @@ function validateTwilioSignature(req, authToken) {
         return false;
     }
 
-    // Build the full URL exactly as Twilio sees it
     const protocol = req.headers['x-forwarded-proto'] || 'https';
     const host     = req.headers['x-forwarded-host'] || req.headers.host;
     const url      = `${protocol}://${host}${req.originalUrl}`;
 
-    return twilio.validateRequest(authToken, signature, url, req.body);
+    try {
+        return twilio.validateRequest(authToken, signature, url, req.body);
+    } catch (err) {
+        logger.error(`Signature validation threw: ${err.message}`);
+        return false;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,7 +57,6 @@ router.post('/incoming', async (req, res) => {
     logger.info(`Incoming call: ${callerPhone} → ${toPhone}`, { callSid });
 
     try {
-        // Fetch assistant + Twilio account info from Laravel
         const { data: config } = await laravelClient.post('/calls/incoming', {
             call_sid:     callSid,
             caller_phone: callerPhone,
@@ -71,20 +69,16 @@ router.post('/incoming', async (req, res) => {
             return respondNotConfigured(res);
         }
 
-        // Validate Twilio signature using the account's auth token from DB
         if (!validateTwilioSignature(req, config.twilio_auth_token)) {
             logger.warn('Twilio signature validation failed — rejecting request', { callSid });
             return res.status(403).send('Forbidden');
         }
 
-        // Respond with TwiML to open MediaStream WebSocket
-        const protocol = req.headers['x-forwarded-proto'] || 'https';
-        const host     = req.headers['x-forwarded-host'] || req.headers.host;
-        const wsUrl    = `wss://${host}/twilio/stream/${callSid}`;
+        const host  = req.headers['x-forwarded-host'] || req.headers.host;
+        const wsUrl = `wss://${host}/twilio/stream/${callSid}`;
 
-        const VoiceResponse = twilio.twiml.VoiceResponse;
-        const response      = new VoiceResponse();
-        const start         = response.start();
+        const response = new twilio.twiml.VoiceResponse();
+        const start    = response.start();
         start.stream({ url: wsUrl });
         response.pause({ length: 60 });
 
@@ -94,7 +88,7 @@ router.post('/incoming', async (req, res) => {
         res.send(response.toString());
 
     } catch (err) {
-        logger.error('Error handling incoming call', { callSid, error: err.message });
+        logger.error(`Error handling incoming call: ${err.message || err.code || JSON.stringify(err)}`, { callSid });
         respondError(res);
     }
 });
@@ -115,10 +109,9 @@ router.post('/status', async (req, res) => {
             call_duration: req.body.CallDuration || null,
         });
     } catch (err) {
-        logger.warn('Failed to update call status in Laravel', { callSid, error: err.message });
+        logger.warn(`Failed to update call status in Laravel: ${err.message}`, { callSid });
     }
 
-    // If Twilio ended the call externally, clean up our session
     if (['completed', 'failed', 'busy', 'no-answer'].includes(callStatus)) {
         const session = callManager.get(callSid);
         if (session && session.status !== 'ended') {
