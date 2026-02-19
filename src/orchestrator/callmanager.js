@@ -63,13 +63,24 @@ class CallSession extends EventEmitter {
         // not a real user turn. Discard it instead of sending to Whisper.
         this.speechStartedDuringAI = false;
 
-        // ── Smart Turn Detection (pipecat: LocalSmartTurnAnalyzerV3) ──────────
-        // After VAD emits speech_end, we ask the Smart Turn model if the user
-        // actually finished their sentence (vs. pausing mid-utterance).
-        // If incomplete, we hold the buffer and wait up to TURN_FALLBACK_MS for
-        // more speech before forcing transcription.
+        // ── Smart Turn Detection (pipecat: BaseSmartTurn / TurnAnalyzerUserTurnStopStrategy) ──
+        // After VAD emits speech_end, Smart Turn model decides if the user finished
+        // their turn or paused mid-sentence.
+        //
+        // If INCOMPLETE: preserve the speech buffer and wait. Silence is accumulated
+        // via VAD 'silence' batch events (each 200ms). When turnSilenceMs reaches
+        // SMART_TURN_STOP_MS (3s), force transcription — exactly matching pipecat's
+        // base_smart_turn.py append_audio() silence counter.
+        //
+        // If user speaks again: turnSilenceMs resets to 0 (speech_start handler),
+        // matching pipecat's append_audio(is_speech=True) resetting _silence_ms.
+        // Next speech_end runs Smart Turn on the full accumulated buffer again.
+        //
+        // There is NO setTimeout for the fallback — silence is tracked via events,
+        // not timers. This eliminates the timer-cancellation infinite loop that
+        // caused 26-second response delays in production.
         this.awaitingTurnConfirmation = false;
-        this.turnConfirmationTimer    = null;
+        this.turnSilenceMs            = 0;   // silence accumulated since last INCOMPLETE
 
         // ── Context summarization ─────────────────────────────────────────────
         // Tracks OpenAI conversation item IDs so we can delete old items after
@@ -135,10 +146,8 @@ class CallSession extends EventEmitter {
             clearTimeout(this.maxDurationTimer);
             this.maxDurationTimer = null;
         }
-        if (this.turnConfirmationTimer) {
-            clearTimeout(this.turnConfirmationTimer);
-            this.turnConfirmationTimer = null;
-        }
+        // No turnConfirmationTimer — Smart Turn fallback is silence-counter-based,
+        // not timer-based. Nothing to cancel here.
     }
 
     getDurationSeconds() {
