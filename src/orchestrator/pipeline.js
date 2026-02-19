@@ -521,7 +521,7 @@ async function cleanup(session, reason = 'completed') {
     if (session.openaiClient) session.openaiClient.disconnect();
     try { await gpuClient.resetVAD(callSid); } catch {}
     await postCallComplete(session, reason);
-    const { callManager } = require('./callmanager');
+    const { callManager } = require('./callmanager'); // lazy to avoid circular dep
     callManager.remove(callSid);
     logger.info('Pipeline cleaned up', { callSid, reason });
 }

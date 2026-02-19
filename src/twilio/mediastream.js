@@ -6,13 +6,10 @@ const logger = require('../utils/logger');
 const { callManager } = require('../orchestrator/callmanager');
 const { initPipeline } = require('../orchestrator/pipeline');
 
-const LARAVEL_URL = process.env.LARAVEL_API_URL;
-const LARAVEL_SECRET = process.env.LARAVEL_API_SECRET;
-
 const laravelClient = axios.create({
-    baseURL: LARAVEL_URL,
-    headers: { 'X-Internal-Secret': LARAVEL_SECRET },
-    timeout: 10000
+    baseURL:  process.env.LARAVEL_API_URL,
+    headers:  { 'X-Internal-Secret': process.env.LARAVEL_API_SECRET },
+    timeout:  10000,
 });
 
 /**
@@ -38,6 +35,23 @@ function attachMediaStreamHandler(server) {
     wss.on('connection', async (ws, request, callSid) => {
         logger.info('MediaStream WebSocket connected', { callSid });
 
+        // FIX: attach error handler BEFORE any awaits.
+        //
+        // Node.js EventEmitter throws an uncaught exception when an 'error' event
+        // fires and there is no registered listener — this would crash the process.
+        // Network errors (TCP RST, ECONNRESET) can arrive at any time, including
+        // during the async laravelClient.get() below. Without an early listener,
+        // any network fault between WS connect and initPipeline completing would
+        // bring down the entire server.
+        //
+        // initPipeline() also attaches a 'close' and an 'error' listener, but
+        // those are only registered after the await completes. This listener
+        // covers the window between connection and pipeline initialization.
+        ws.on('error', (err) => {
+            logger.error('MediaStream WS error (pre-pipeline)', { callSid, error: err.message });
+            // ws will close automatically after emitting error; no explicit close needed.
+        });
+
         try {
             // Laravel returns a slim, pre-processed config.
             // The system_prompt is already fully built server-side (dynamic variables
@@ -53,20 +67,20 @@ function attachMediaStreamHandler(server) {
 
             const session = callManager.create({
                 callSid,
-                callerPhone: config.caller_phone,
-                assistantId: config.assistant_id,
-                organizationId: config.organization_id,
-                systemPrompt: config.system_prompt,
-                language: config.language || 'en',
-                voice: config.voice || null,
+                callerPhone:     config.caller_phone,
+                assistantId:     config.assistant_id,
+                organizationId:  config.organization_id,
+                systemPrompt:    config.system_prompt,
+                language:        config.language || 'en',
+                voice:           config.voice || null,
                 twilioAccountSid: config.twilio_account_sid,
-                twilioAuthToken: config.twilio_auth_token,
-                assistantConfig: config
+                twilioAuthToken:  config.twilio_auth_token,
+                assistantConfig:  config,
             });
 
             await initPipeline(session, ws, {
                 systemPrompt: config.system_prompt,
-                language: session.language
+                language:     session.language,
             });
 
         } catch (err) {
