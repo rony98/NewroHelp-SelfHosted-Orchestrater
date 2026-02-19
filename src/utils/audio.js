@@ -11,18 +11,27 @@
 //   Twilio media send   →  8kHz mulaw (direct mulaw encode — no decimation here)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ─── mulaw codec ─────────────────────────────────────────────────────────────
+// ─── mulaw decode table ──────────────────────────────────────────────────────
+// Pre-compute the full 256-entry mulaw → PCM16 lookup table at startup.
+// Pipecat uses audioop.ulaw2lin (C extension). We don't have that in Node.js,
+// but a lookup table is the next best thing: O(1) per sample, no branches,
+// no log/exp math, no JS array allocations on the hot path.
+const MULAW_DECODE = new Int16Array(256);
+(function buildMulawDecodeTable() {
+    for (let i = 0; i < 256; i++) {
+        let byte    = ~i & 0xFF;
+        const sign  = byte & 0x80;
+        const exp   = (byte >> 4) & 0x07;
+        const mant  = byte & 0x0F;
+        let sample  = ((mant << 1) + 33) << exp;
+        sample -= 33;
+        MULAW_DECODE[i] = sign ? -sample : sample;
+    }
+})();
 
-function mulawDecode(byte) {
-    byte = ~byte;
-    const sign     = byte & 0x80;
-    const exponent = (byte >> 4) & 0x07;
-    const mantissa = byte & 0x0F;
-    let   sample   = ((mantissa << 1) + 33) << exponent;
-    sample -= 33;
-    return sign ? -sample : sample;
-}
-
+// ─── mulaw encode ────────────────────────────────────────────────────────────
+// Kept as a function (not a table) because encode runs only on TTS output,
+// which is already batched — it is not the bottleneck.
 function mulawEncode(sample) {
     const MAX  = 32767;
     const BIAS = 0x84;
@@ -38,33 +47,57 @@ function mulawEncode(sample) {
 // ─── Twilio → VAD/STT ────────────────────────────────────────────────────────
 
 /**
- * Convert Twilio mulaw buffer (8kHz) to PCM16 buffer (16kHz)
+ * Convert Twilio mulaw buffer (8kHz) to PCM16 buffer (16kHz).
  * Upsample 8kHz → 16kHz via linear interpolation for VAD/STT input.
+ *
+ * Previously used push() to three intermediate JS arrays (pcm8k, pcm16k).
+ * Now pre-allocates the exact output buffer and writes in-place — no GC
+ * pressure on a path called ~50×/second per active call.
  *
  * @param {Buffer} mulawBuffer - Raw mulaw bytes from Twilio MediaStream
  * @returns {Buffer} - PCM16 LE buffer at 16kHz
  */
 function twilioMulawToPcm16(mulawBuffer) {
-    const pcm8k = [];
+    const n   = mulawBuffer.length;        // number of 8kHz samples
+    const out = Buffer.allocUnsafe(n * 4); // 2× upsample × 2 bytes/sample
 
-    for (let i = 0; i < mulawBuffer.length; i++) {
-        pcm8k.push(mulawDecode(mulawBuffer[i]));
+    let outIdx = 0;
+    for (let i = 0; i < n - 1; i++) {
+        const s0 = MULAW_DECODE[mulawBuffer[i]];
+        const s1 = MULAW_DECODE[mulawBuffer[i + 1]];
+        out.writeInt16LE(s0, outIdx);
+        out.writeInt16LE(Math.round((s0 + s1) / 2), outIdx + 2);
+        outIdx += 4;
     }
+    // Replicate last sample at boundary
+    const last = MULAW_DECODE[mulawBuffer[n - 1]];
+    out.writeInt16LE(last, outIdx);
+    out.writeInt16LE(last, outIdx + 2);
 
-    // Upsample 8kHz → 16kHz by linear interpolation
-    const pcm16k = [];
-    for (let i = 0; i < pcm8k.length - 1; i++) {
-        pcm16k.push(pcm8k[i]);
-        pcm16k.push(Math.round((pcm8k[i] + pcm8k[i + 1]) / 2));
-    }
-    pcm16k.push(pcm8k[pcm8k.length - 1]);
-    pcm16k.push(pcm8k[pcm8k.length - 1]);
+    return out;
+}
 
-    const buf = Buffer.allocUnsafe(pcm16k.length * 2);
-    for (let i = 0; i < pcm16k.length; i++) {
-        buf.writeInt16LE(Math.max(-32768, Math.min(32767, pcm16k[i])), i * 2);
+// ─── silence pre-filter ──────────────────────────────────────────────────────
+
+/**
+ * Fast amplitude-based silence check on a PCM16 buffer.
+ * Returns true if the buffer contains only silence (below threshold).
+ *
+ * Pipecat uses the same pattern (SPEAKING_THRESHOLD = 20 / max abs amplitude)
+ * before running the Silero VAD model, eliminating the GPU HTTP call for
+ * silent batches entirely. On phone calls, silence dominates — before the
+ * caller speaks, between turns, hold music periods, etc.
+ *
+ * @param {Buffer} pcm16Buffer - PCM16 LE buffer
+ * @returns {boolean} true if silent
+ */
+const SPEAKING_THRESHOLD = 20;
+function isSilence(pcm16Buffer) {
+    const samples = pcm16Buffer.length >> 1;
+    for (let i = 0; i < samples; i++) {
+        if (Math.abs(pcm16Buffer.readInt16LE(i * 2)) > SPEAKING_THRESHOLD) return false;
     }
-    return buf;
+    return true;
 }
 
 // ─── TTS → Twilio ────────────────────────────────────────────────────────────
@@ -72,21 +105,19 @@ function twilioMulawToPcm16(mulawBuffer) {
 /**
  * Convert PCM16 buffer to Twilio mulaw buffer.
  *
- * The GPU server now handles all resampling via soxr (professional-grade
- * resampler used in broadcast/DAW equipment). It streams at 8kHz PCM16
- * directly, so this function just mulaw-encodes sample by sample — no
- * decimation or filtering needed here at all.
+ * The GPU server handles all resampling via soxr.ResampleStream (stateful,
+ * continuous filter across chunks). It streams 8kHz PCM16 directly, so
+ * this function just mulaw-encodes sample by sample.
  *
  * @param {Buffer} pcm16Buffer - PCM16 LE buffer at 8kHz (from GPU server)
  * @returns {Buffer} - Raw mulaw bytes for Twilio at 8kHz
  */
 function pcm16ToTwilioMulaw(pcm16Buffer) {
-    const samples = pcm16Buffer.length / 2;
+    const samples = pcm16Buffer.length >> 1;
     const mulaw   = Buffer.allocUnsafe(samples);
 
     for (let i = 0; i < samples; i++) {
-        const sample = pcm16Buffer.readInt16LE(i * 2);
-        mulaw[i] = mulawEncode(sample);
+        mulaw[i] = mulawEncode(pcm16Buffer.readInt16LE(i * 2));
     }
 
     return mulaw;
@@ -102,12 +133,12 @@ function pcm16ToTwilioMulaw(pcm16Buffer) {
  * @returns {string} - Base64 encoded WAV file
  */
 function pcm16ToBase64Wav(pcm16Buffer, sampleRate = 16000) {
-    const numChannels  = 1;
+    const numChannels   = 1;
     const bitsPerSample = 16;
-    const byteRate     = sampleRate * numChannels * (bitsPerSample / 8);
-    const blockAlign   = numChannels * (bitsPerSample / 8);
-    const dataSize     = pcm16Buffer.length;
-    const headerSize   = 44;
+    const byteRate      = sampleRate * numChannels * (bitsPerSample / 8);
+    const blockAlign    = numChannels * (bitsPerSample / 8);
+    const dataSize      = pcm16Buffer.length;
+    const headerSize    = 44;
 
     const wav = Buffer.allocUnsafe(headerSize + dataSize);
 
@@ -132,15 +163,33 @@ function pcm16ToBase64Wav(pcm16Buffer, sampleRate = 16000) {
 /**
  * Convert base64 WAV/PCM from GPU server back to raw PCM16 buffer.
  *
+ * Walks the WAV chunk list to find the 'data' chunk rather than hardcoding
+ * offset 44. Standard WAV headers are 44 bytes, but extended fmt chunks,
+ * LIST metadata, and JUNK/PAD chunks can push the data offset higher.
+ * Hardcoding 44 silently returns garbage bytes in those cases.
+ *
  * @param {string} base64Audio - Base64 encoded audio from GPU server
  * @returns {Buffer} - Raw PCM16 LE buffer
  */
 function base64ToPcm16(base64Audio) {
-    const wavBuffer = Buffer.from(base64Audio, 'base64');
-    if (wavBuffer.toString('ascii', 0, 4) === 'RIFF') {
-        return wavBuffer.slice(44);
+    const wav = Buffer.from(base64Audio, 'base64');
+    if (wav.toString('ascii', 0, 4) !== 'RIFF') {
+        return wav; // not a WAV file — treat as raw PCM
     }
-    return wavBuffer;
+
+    // Walk chunk list starting after the RIFF header (12 bytes)
+    let offset = 12;
+    while (offset + 8 <= wav.length) {
+        const chunkId   = wav.toString('ascii', offset, offset + 4);
+        const chunkSize = wav.readUInt32LE(offset + 4);
+        if (chunkId === 'data') {
+            return wav.slice(offset + 8, offset + 8 + chunkSize);
+        }
+        // WAV chunks are padded to even byte boundaries
+        offset += 8 + chunkSize + (chunkSize & 1);
+    }
+
+    return wav.slice(44); // fallback for malformed headers
 }
 
 /**
@@ -155,5 +204,6 @@ module.exports = {
     pcm16ToTwilioMulaw,
     pcm16ToBase64Wav,
     base64ToPcm16,
+    isSilence,
     bufferToBase64,
 };
