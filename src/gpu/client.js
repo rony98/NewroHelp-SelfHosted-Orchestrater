@@ -91,6 +91,35 @@ async function resetVAD(sessionId) {
     }
 }
 
+/**
+ * Smart Turn Detection — ask the GPU server whether the user has finished
+ * their turn (pipecat: LocalSmartTurnAnalyzerV3 / predict_endpoint).
+ *
+ * Called immediately after VAD emits speech_end with the full speech buffer
+ * for the current utterance (PCM base64, same format as STT input).
+ *
+ * Returns: { complete: bool, confidence: float, fallback: bool }
+ * Always resolves — never throws. On network error returns complete=true
+ * (safe fallback: proceed to transcribe as normal).
+ *
+ * Timeout: 1500ms — Smart Turn v3 CPU inference is ~12–65ms. The generous
+ * timeout accounts for network RTT to RunPod. If we miss the window the
+ * fallback is just the old silence-only behavior, not a broken call.
+ */
+async function checkTurnComplete(audioBase64) {
+    try {
+        const { data } = await gpuHttp.post('/vad/turn_complete', {
+            audio:       audioBase64,
+            sample_rate: 16000,
+        }, { timeout: 1500 });
+        return data;
+    } catch (err) {
+        // Don't log at error level — occasional timeouts are expected
+        logger.warn('Smart Turn check failed (fallback: complete=true)', { error: err.message });
+        return { complete: true, confidence: 1.0, fallback: true };
+    }
+}
+
 async function health() {
     try {
         const { data } = await gpuHttp.get('/health', { timeout: 5000 });
@@ -101,4 +130,4 @@ async function health() {
     }
 }
 
-module.exports = { detectVAD, transcribe, synthesize, synthesizeStream, resetVAD, health };
+module.exports = { detectVAD, transcribe, synthesize, synthesizeStream, resetVAD, checkTurnComplete, health };

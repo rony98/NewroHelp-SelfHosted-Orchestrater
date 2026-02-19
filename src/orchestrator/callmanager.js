@@ -56,6 +56,26 @@ class CallSession extends EventEmitter {
         this.speechStartedAt      = null;   // Date.now() when current turn started
         this.transcribeInFlight   = false;  // guards against concurrent STT calls
 
+        // ── STT mute during AI speaking (pipecat: STTMuteFilter) ──────────────
+        // Track whether user speech was first detected while the AI was playing.
+        // If the AI finishes before the user reaches INTERRUPT_THRESHOLD, the
+        // buffered audio is almost certainly the AI's echo or background noise —
+        // not a real user turn. Discard it instead of sending to Whisper.
+        this.speechStartedDuringAI = false;
+
+        // ── Smart Turn Detection (pipecat: LocalSmartTurnAnalyzerV3) ──────────
+        // After VAD emits speech_end, we ask the Smart Turn model if the user
+        // actually finished their sentence (vs. pausing mid-utterance).
+        // If incomplete, we hold the buffer and wait up to TURN_FALLBACK_MS for
+        // more speech before forcing transcription.
+        this.awaitingTurnConfirmation = false;
+        this.turnConfirmationTimer    = null;
+
+        // ── Context summarization ─────────────────────────────────────────────
+        // Tracks OpenAI conversation item IDs so we can delete old items after
+        // summarizing. Populated by realtime.js item_created events.
+        this.conversationItemIds = [];
+
         // Timers
         this.silenceTimer      = null;
         this.maxDurationTimer  = null;
@@ -114,6 +134,10 @@ class CallSession extends EventEmitter {
         if (this.maxDurationTimer) {
             clearTimeout(this.maxDurationTimer);
             this.maxDurationTimer = null;
+        }
+        if (this.turnConfirmationTimer) {
+            clearTimeout(this.turnConfirmationTimer);
+            this.turnConfirmationTimer = null;
         }
     }
 

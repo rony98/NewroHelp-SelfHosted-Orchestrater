@@ -181,6 +181,19 @@ class OpenAIRealtimeClient extends EventEmitter {
         });
     }
 
+    /**
+     * Delete a conversation item from the OpenAI Realtime session.
+     * Used by context summarization to remove old items after injecting summary.
+     * See: https://platform.openai.com/docs/api-reference/realtime-client-events/conversation/item/delete
+     */
+    deleteItem(itemId) {
+        this._send({
+            type: 'conversation.item.delete',
+            item_id: itemId,
+        });
+        logger.info('Deleted conversation item', { callSid: this.callSid, itemId });
+    }
+
     cancelResponse() {
         if (this.currentResponseId) {
             this._send({ type: 'response.cancel', response_id: this.currentResponseId });
@@ -193,6 +206,16 @@ class OpenAIRealtimeClient extends EventEmitter {
 
             case 'response.text.delta':
                 this.emit('text_delta', event.delta);
+                break;
+
+            // ── Conversation item tracking (for context summarization) ────────
+            // Every message, function call, and function result added to the
+            // OpenAI conversation emits this event. We emit item_created so
+            // pipeline.js can track IDs and delete old items after summarizing.
+            case 'conversation.item.created':
+                if (event.item?.id) {
+                    this.emit('item_created', event.item.id, event.item.role || event.item.type);
+                }
                 break;
 
             case 'response.text.done':

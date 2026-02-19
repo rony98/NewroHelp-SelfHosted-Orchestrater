@@ -3,6 +3,7 @@
 const axios                          = require('axios');
 const OpenAIRealtimeClient           = require('../openai/realtime');
 const gpuClient                      = require('../gpu/client');
+const { checkTurnComplete }          = gpuClient;
 const { buildTools, execute: executeFn } = require('./functions');
 const { twilioMulawToPcm16, pcm16ToBase64Wav, pcm16ToTwilioMulaw, isSilence } = require('../utils/audio');
 const logger                         = require('../utils/logger');
@@ -27,6 +28,34 @@ const INTERRUPT_THRESHOLD = 1;
 
 const PRE_ROLL_BATCHES = 2;    // 2 × 200ms = 400ms pre-roll on speech onset
 const MAX_SPEECH_MS    = 8000; // force transcription if VAD stuck hot
+
+// ─── Minimum speech duration gate (pipecat: minimum_speech_duration) ─────────
+// Ignore utterances shorter than this threshold. Coughs, breathing, and brief
+// noise bursts that slip past RNNoise and VAD are typically < 200ms.
+// 200ms matches pipecat's default minimum_speech_duration parameter.
+const MIN_SPEECH_MS = 200;
+
+// ─── Smart Turn fallback timer ────────────────────────────────────────────────
+// If Smart Turn says "incomplete" and no new speech arrives within this window,
+// force transcription anyway. Matches pipecat's VADParams stop_secs fallback.
+const TURN_FALLBACK_MS = 2000;
+
+// ─── Context summarization ────────────────────────────────────────────────────
+// When the transcript exceeds this word count, summarize and trim the OpenAI
+// context window. Per-assistant opt-in via assistantConfig.context_summarization.
+// ~1500 words ≈ 2000 tokens — safe headroom before OpenAI Realtime context limit.
+const CONTEXT_SUMMARIZE_WORDS = 1500;
+
+// ─── Filler phrases (pipecat: LLMUserContextAggregatorProcessor pattern) ──────
+// Played immediately when a tool call starts, before the HTTP response arrives.
+// Gives the caller something to hear during tool execution latency.
+const DEFAULT_FILLER_PHRASES = [
+    "One moment.",
+    "Let me check that for you.",
+    "Sure, give me just a second.",
+    "Let me look that up.",
+    "One second.",
+];
 
 const laravelClient = axios.create({
     baseURL: process.env.LARAVEL_API_URL,
@@ -137,12 +166,55 @@ async function initPipeline(session, mediaStreamWs, pipelineConfig) {
 
     openaiClient.on('function_call', async ({ call_id, name, args }) => {
         logger.info(`Function call: ${name}`, { callSid, args });
+
+        // ── Filler phrase (pipecat: pre-tool-call filler audio) ───────────────
+        // Play a brief phrase immediately while the tool HTTP call is in flight.
+        // The tool result and AI response queue naturally after the filler via
+        // ttsSentenceQueue, so ordering is preserved.
+        //
+        // Enabled if assistantConfig.enable_filler_phrases = true (default: true)
+        // or assistantConfig.filler_phrases = ['custom phrase', ...] (custom list).
+        // Disabled explicitly with enable_filler_phrases: false.
+        const fillerEnabled = session.assistantConfig.enable_filler_phrases !== false;
+        if (fillerEnabled && !session.isAISpeaking && session.status === 'active') {
+            const phrases = Array.isArray(session.assistantConfig.filler_phrases) && session.assistantConfig.filler_phrases.length > 0
+                ? session.assistantConfig.filler_phrases
+                : DEFAULT_FILLER_PHRASES;
+            const filler = phrases[Math.floor(Math.random() * phrases.length)];
+            // Queue filler TTS exactly like a normal AI sentence — non-blocking
+            session.ttsSentenceQueue = session.ttsSentenceQueue.then(async () => {
+                if (session.status === 'ending' || session.status === 'ended') return;
+                logger.info(`Filler phrase: "${filler}"`, { callSid });
+                await speakToTwilio(session, filler);
+            });
+        }
+
         try {
             const result = await executeFn(name, args, session);
             openaiClient.sendFunctionResult(call_id, result);
         } catch (err) {
             logger.error(`Function ${name} failed`, { callSid, error: err.message });
             openaiClient.sendFunctionResult(call_id, { error: err.message });
+        }
+    });
+
+    // ── Conversation item tracking (for context summarization) ────────────────
+    // OpenAI Realtime emits conversation.item.created for every message,
+    // function call, and function result. We track their IDs so context
+    // summarization can delete old items after injecting a summary.
+    openaiClient.on('item_created', (itemId, role) => {
+        session.conversationItemIds.push(itemId);
+
+        // Trigger summarization when transcript word count exceeds threshold.
+        // assistantConfig.context_summarization must be true (opt-in, default off).
+        // Most calls (<10 min) never hit this. Long calls and edge cases are covered.
+        if (session.assistantConfig.context_summarization) {
+            const wordCount = session.transcript.reduce((sum, t) => sum + (t.message || '').split(' ').length, 0);
+            if (wordCount >= CONTEXT_SUMMARIZE_WORDS) {
+                summarizeContext(session).catch(err =>
+                    logger.error('Context summarization failed', { callSid, error: err.message })
+                );
+            }
         }
     });
 
@@ -233,40 +305,162 @@ function handleIncomingAudio(session, mulawBase64) {
                 session.isSpeaking      = true;
                 session.speechStartedAt = Date.now();
                 session.clearSilenceTimer();
+
+                // ── STT mute: note if speech started while AI was playing ─────
+                // If the AI finishes before the user accumulates INTERRUPT_THRESHOLD
+                // speech events, this audio is likely the AI's echo or ambient
+                // background — not a real user utterance. Flag it for discard.
+                // (pipecat: STTMuteFilter behavior)
+                session.speechStartedDuringAI = session.isAISpeaking;
+
                 // Pre-roll: audio from before speech_start so short words aren't clipped
                 if (session.preRollBuffer.length > 0) {
                     session.appendSpeechBuffer(Buffer.concat(session.preRollBuffer));
                 }
                 session.appendSpeechBuffer(batchBuf);  // first batch
             } else {
-                // Each subsequent batch is added here exactly once.
-                // (Not at the top of handleIncomingAudio — that was the double-write.)
                 session.appendSpeechBuffer(batchBuf);
             }
 
             if (session.speechStartCount >= INTERRUPT_THRESHOLD && session.isAISpeaking) {
+                // User has accumulated enough speech events to be a real interruption.
+                // Clear the mute flag — this is definitely intentional speech.
+                session.speechStartedDuringAI = false;
                 interruptAI(session);
             }
 
             if (session.speechStartedAt && (Date.now() - session.speechStartedAt) > MAX_SPEECH_MS) {
                 logger.warn('Max speech duration reached — forcing transcription', { callSid: session.callSid });
                 const speechAudio = session.flushSpeechBuffer();
-                session.isSpeaking       = false;
-                session.speechStartedAt  = null;
-                session.speechStartCount = 0;
+                session.isSpeaking              = false;
+                session.speechStartedAt         = null;
+                session.speechStartCount        = 0;
+                session.speechStartedDuringAI   = false;
+                session.awaitingTurnConfirmation = false;
+                if (session.turnConfirmationTimer) {
+                    clearTimeout(session.turnConfirmationTimer);
+                    session.turnConfirmationTimer = null;
+                }
                 if (speechAudio.length > 0) await transcribeAndRespond(session, speechAudio);
             }
 
         } else if (event === 'silence') {
-            session.speechStartCount = 0;
+            // ── Smart Turn: new speech while awaiting confirmation ────────────
+            // VAD reported steady silence — reset only the event counter, not
+            // awaitingTurnConfirmation. If we're in the 2-second hold window
+            // waiting for more speech and nothing arrives, the fallback timer
+            // fires and proceeds to transcribe.
+            if (!session.awaitingTurnConfirmation) {
+                session.speechStartCount = 0;
+            }
 
         } else if (event === 'speech_end') {
+            const speechDurationMs = session.speechStartedAt
+                ? Date.now() - session.speechStartedAt
+                : 0;
+
+            const speechAudio = session.flushSpeechBuffer();
+
+            // Reset speech tracking
             session.speechStartCount = 0;
             session.isSpeaking       = false;
             session.speechStartedAt  = null;
-            const speechAudio = session.flushSpeechBuffer();
-            if (speechAudio.length > 0) await transcribeAndRespond(session, speechAudio);
-            session.startSilenceTimer(() => endCall(session, 'no_response'));
+
+            // ── Minimum speech duration gate ──────────────────────────────────
+            // Discard utterances shorter than MIN_SPEECH_MS (200ms). Coughs,
+            // breathing, and brief noise bursts that survive RNNoise + VAD are
+            // typically <100ms. Sending them to Whisper wastes GPU cycles and
+            // produces hallucinated transcriptions.
+            // (pipecat: VADParams minimum_speech_duration parameter)
+            if (speechDurationMs < MIN_SPEECH_MS) {
+                logger.debug(
+                    `Speech too short (${speechDurationMs}ms < ${MIN_SPEECH_MS}ms) — discarding`,
+                    { callSid: session.callSid }
+                );
+                session.speechStartedDuringAI = false;
+                session.startSilenceTimer(() => endCall(session, 'no_response'));
+                return;
+            }
+
+            // ── STT mute during AI speaking ───────────────────────────────────
+            // If speech started while AI was playing AND the user never
+            // accumulated enough events to trigger an interruption, this is
+            // almost certainly the AI's echo, hold music bleed, or background
+            // noise — not real user speech. Discard silently.
+            // (pipecat: STTMuteFilter)
+            if (session.speechStartedDuringAI && session.speechStartCount < INTERRUPT_THRESHOLD) {
+                logger.debug('Speech during AI playback below interrupt threshold — discarding (echo/background)', {
+                    callSid: session.callSid,
+                });
+                session.speechStartedDuringAI = false;
+                session.startSilenceTimer(() => endCall(session, 'no_response'));
+                return;
+            }
+            session.speechStartedDuringAI = false;
+
+            if (speechAudio.length === 0) {
+                session.startSilenceTimer(() => endCall(session, 'no_response'));
+                return;
+            }
+
+            // ── Smart Turn Detection ──────────────────────────────────────────
+            // Ask the Smart Turn v3 model whether the user has finished their
+            // turn or paused mid-sentence ("My phone number is, um...").
+            // (pipecat: LocalSmartTurnAnalyzerV3 / TurnAnalyzerUserTurnStopStrategy)
+            //
+            // If incomplete: hold the audio buffer for up to TURN_FALLBACK_MS
+            // for the user to continue. If they do, VAD will accumulate new
+            // speech into the session normally. When VAD fires speech_end again,
+            // Smart Turn re-evaluates the full buffer (now longer).
+            // If they don't continue: the fallback timer fires and transcribes.
+            //
+            // If complete (or model unavailable): proceed to transcribe immediately.
+            const audioB64ForTurn = pcm16ToBase64Wav(speechAudio);
+            const turnResult      = await checkTurnComplete(audioB64ForTurn);
+
+            if (!turnResult.complete) {
+                logger.info(
+                    `Smart Turn: INCOMPLETE (confidence=${turnResult.confidence?.toFixed(3)}) — holding ${speechDurationMs}ms buffer`,
+                    { callSid: session.callSid }
+                );
+
+                // Restore buffer so the next speech_start can append to it
+                session.appendSpeechBuffer(speechAudio);
+                session.isSpeaking               = true;
+                session.speechStartedAt          = Date.now() - speechDurationMs;
+                session.awaitingTurnConfirmation  = true;
+
+                // Fallback timer: if no new speech in TURN_FALLBACK_MS, transcribe anyway.
+                // Prevents indefinite waiting if the model was wrong about incompleteness.
+                session.turnConfirmationTimer = setTimeout(async () => {
+                    if (!session.awaitingTurnConfirmation) return;
+                    logger.info('Smart Turn fallback timer fired — forcing transcription', { callSid: session.callSid });
+                    session.awaitingTurnConfirmation = false;
+                    session.turnConfirmationTimer    = null;
+                    const audio = session.flushSpeechBuffer();
+                    session.isSpeaking       = false;
+                    session.speechStartedAt  = null;
+                    session.speechStartCount = 0;
+                    if (audio.length > 0) await transcribeAndRespond(session, audio);
+                    session.startSilenceTimer(() => endCall(session, 'no_response'));
+                }, TURN_FALLBACK_MS);
+
+            } else {
+                // Turn is complete — clear any pending confirmation state and transcribe
+                if (session.turnConfirmationTimer) {
+                    clearTimeout(session.turnConfirmationTimer);
+                    session.turnConfirmationTimer = null;
+                }
+                session.awaitingTurnConfirmation = false;
+
+                logger.info(
+                    `Smart Turn: COMPLETE (confidence=${turnResult.confidence?.toFixed(3)}) — transcribing ${speechDurationMs}ms`,
+                    { callSid: session.callSid }
+                );
+
+                await transcribeAndRespond(session, speechAudio);
+                session.startSilenceTimer(() => endCall(session, 'no_response'));
+            }
         }
 
     }).catch(() => {}).finally(() => {
@@ -284,12 +478,8 @@ async function transcribeAndRespond(session, pcm16Buffer) {
     let transcript;
     try {
         const audioB64 = pcm16ToBase64Wav(pcm16Buffer);
-        const { data } = await axios.post(
-            `${process.env.GPU_SERVER_URL}/stt/transcribe`,
-            { audio: audioB64, language: session.language, sample_rate: 16000 },
-            { headers: { 'X-API-Key': process.env.GPU_SERVER_API_KEY }, timeout: 30000 }
-        );
-        transcript = data.text?.trim();
+        const data     = await gpuClient.transcribe(audioB64, session.language);
+        transcript     = data.text?.trim();
     } catch (err) {
         logger.error('STT failed', { callSid, error: err.message });
         return;
@@ -306,6 +496,98 @@ async function transcribeAndRespond(session, pcm16Buffer) {
         session.openaiClient.sendUserMessage(transcript);
     } catch (err) {
         logger.error('OpenAI send failed', { callSid, error: err.message });
+    }
+}
+
+/**
+ * Context summarization (pipecat: LLMContextSummarizationConfig).
+ *
+ * When the session transcript grows beyond CONTEXT_SUMMARIZE_WORDS, we:
+ *   1. Make a one-off call to the OpenAI Chat Completions API to summarize
+ *      the full transcript so far into a concise paragraph.
+ *   2. Inject the summary into the Realtime session as a system message
+ *      ("Earlier in this call: [summary]").
+ *   3. Delete all tracked conversation items older than the summary injection
+ *      to free context window space.
+ *
+ * This keeps the Realtime session's effective context bounded regardless of
+ * call duration. Opt-in via assistantConfig.context_summarization: true.
+ *
+ * Guards:
+ *   - Only runs once per call (once summarized, transcript is cleared and
+ *     the word count won't re-trigger immediately)
+ *   - Re-entrant: if a summarization is already in flight, skip
+ */
+let _summarizationInFlight = false;  // module-level flag (per-session guard via session flag)
+
+async function summarizeContext(session) {
+    const { callSid } = session;
+
+    // Per-session re-entrant guard
+    if (session._summarizationInFlight) return;
+    session._summarizationInFlight = true;
+
+    try {
+        logger.info('Context summarization triggered', {
+            callSid,
+            transcriptWords: session.transcript.reduce((s, t) => s + (t.message || '').split(' ').length, 0),
+            itemCount: session.conversationItemIds.length,
+        });
+
+        // Build readable transcript for the summarizer
+        const transcriptText = session.transcript
+            .map(t => `${t.role === 'user' ? 'User' : 'Assistant'}: ${t.message}`)
+            .join('\n');
+
+        // Call standard OpenAI Chat Completions (not Realtime) for summarization
+        const { data: summaryResponse } = await axios.post(
+            'https://api.openai.com/v1/chat/completions',
+            {
+                model: 'gpt-4o-mini',  // cheap, fast — summarization doesn't need gpt-4o
+                max_tokens: 300,
+                messages: [
+                    {
+                        role: 'system',
+                        content: 'Summarize the following phone call transcript in 2-4 sentences. ' +
+                            'Focus on what the caller needed and what was resolved or agreed upon. ' +
+                            'Be concise and factual.',
+                    },
+                    { role: 'user', content: transcriptText },
+                ],
+            },
+            {
+                headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
+                timeout: 15000,
+            }
+        );
+
+        const summary = summaryResponse.choices?.[0]?.message?.content?.trim();
+        if (!summary) {
+            logger.warn('Summarization returned empty result', { callSid });
+            return;
+        }
+
+        logger.info(`Summarized ${session.conversationItemIds.length} items`, { callSid, summary: summary.slice(0, 100) });
+
+        // Inject summary as system context into the Realtime session
+        session.openaiClient.injectContext(`Earlier in this call: ${summary}`);
+
+        // Delete all old conversation items to free context window
+        const idsToDelete = [...session.conversationItemIds];
+        for (const itemId of idsToDelete) {
+            session.openaiClient.deleteItem(itemId);
+        }
+        session.conversationItemIds = [];
+
+        // Clear the local transcript (it's been summarized; fresh turns will re-populate)
+        session.transcript = [];
+
+        logger.info('Context summarization complete', { callSid });
+
+    } catch (err) {
+        logger.error('Context summarization error', { callSid, error: err.message });
+    } finally {
+        session._summarizationInFlight = false;
     }
 }
 

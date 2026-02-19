@@ -72,6 +72,19 @@ app.get('/api/internal/calls/:callSid/config', (req, res) => {
         transfer_to_number: [],
         transfer_to_agent:  [],
         custom_tools:       [],
+
+        // ── Filler phrases (pipeline.js: played during tool execution) ────────
+        // enable_filler_phrases: true  → use DEFAULT_FILLER_PHRASES from pipeline.js
+        // filler_phrases: [...]        → override with custom list (optional)
+        // enable_filler_phrases: false → disable entirely
+        enable_filler_phrases: true,
+        filler_phrases: [],   // empty = use pipeline.js defaults
+
+        // ── Context summarization (pipeline.js: summarizeContext) ─────────────
+        // Summarizes and trims the OpenAI Realtime context when the transcript
+        // exceeds ~1500 words. Opt-in because most calls never hit this limit.
+        // Set to true to test with long calls.
+        context_summarization: false,
     });
 });
 
