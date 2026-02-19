@@ -14,13 +14,6 @@ const laravelClient = axios.create({
     timeout:  10000,
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Twilio Signature Validation
-//
-// Only runs when TWILIO_VALIDATE_SIGNATURES=true in .env AND the Laravel
-// /calls/incoming response includes twilio_auth_token. Safe to enable once
-// Laravel is updated to return the token.
-// ─────────────────────────────────────────────────────────────────────────────
 function validateTwilioSignature(req, authToken) {
     if (process.env.TWILIO_VALIDATE_SIGNATURES !== 'true') return true;
     if (!authToken) {
@@ -39,21 +32,23 @@ function validateTwilioSignature(req, authToken) {
     const url      = `${protocol}://${host}${req.originalUrl}`;
 
     try {
-        const callSid     = req.body.CallSid;
-        const callerPhone = req.body.From;
-        const toPhone     = req.body.To;
-
-        logger.info(`Signature validation successful for incoming call: ${callerPhone} → ${toPhone}`, { callSid });
-        return twilio.validateRequest(authToken, signature, url, req.body);
+        // FIX: previous code logged "Signature validation successful" BEFORE
+        // calling validateRequest — always logged success regardless of actual result.
+        const valid = twilio.validateRequest(authToken, signature, url, req.body);
+        if (valid) {
+            logger.info('Twilio signature validated', {
+                callSid: req.body.CallSid, from: req.body.From, to: req.body.To,
+            });
+        } else {
+            logger.warn('Twilio signature validation failed', { callSid: req.body.CallSid });
+        }
+        return valid;
     } catch (err) {
         logger.error(`Signature validation threw: ${err.message}`);
         return false;
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /twilio/incoming
-// ─────────────────────────────────────────────────────────────────────────────
 router.post('/incoming', async (req, res) => {
     const callSid     = req.body.CallSid;
     const callerPhone = req.body.From;
@@ -83,11 +78,9 @@ router.post('/incoming', async (req, res) => {
         const wsUrl = `wss://${host}/twilio/stream/${callSid}`;
 
         const response = new twilio.twiml.VoiceResponse();
-        const connect  = response.connect();
-        connect.stream({ url: wsUrl });
+        response.connect().stream({ url: wsUrl });
 
         logger.info('Responding with TwiML MediaStream', { callSid, wsUrl });
-
         res.type('text/xml');
         res.send(response.toString());
 
@@ -97,13 +90,9 @@ router.post('/incoming', async (req, res) => {
     }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /twilio/status
-// ─────────────────────────────────────────────────────────────────────────────
 router.post('/status', async (req, res) => {
     const callSid    = req.body.CallSid;
     const callStatus = req.body.CallStatus;
-
     logger.info(`Call status: ${callStatus}`, { callSid });
 
     try {
@@ -127,9 +116,6 @@ router.post('/status', async (req, res) => {
     res.sendStatus(200);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 function respondNotConfigured(res) {
     const r = new twilio.twiml.VoiceResponse();
     r.say('Sorry, this number is not configured. Please try again later.');

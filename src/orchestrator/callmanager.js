@@ -1,58 +1,71 @@
 'use strict';
 
 const { EventEmitter } = require('events');
-const { v4: uuidv4 } = require('uuid');
-const logger = require('../utils/logger');
+const { v4: uuidv4 }   = require('uuid');
+const logger            = require('../utils/logger');
 
-/**
- * Represents one active phone call's state.
- */
 class CallSession extends EventEmitter {
     constructor({ callSid, callerPhone, assistantId, organizationId, systemPrompt, language, voice, assistantConfig, twilioAccountSid, twilioAuthToken }) {
         super();
 
         // Identity
-        this.callSid = callSid;
-        this.callerPhone = callerPhone;
-        this.assistantId = assistantId;
+        this.callSid        = callSid;
+        this.callerPhone    = callerPhone;
+        this.assistantId    = assistantId;
         this.organizationId = organizationId;
-        this.sessionId = uuidv4();
+        this.sessionId      = uuidv4();
 
-        // Full assistant config (tools, transfer rules, flags, etc.)
-        this.assistantConfig = assistantConfig || {};
-
-        // Twilio credentials — fetched from DB via Laravel, not from .env
-        // These are per-account credentials stored in twilio_account table
+        // Config
+        this.assistantConfig  = assistantConfig || {};
         this.twilioAccountSid = twilioAccountSid;
-        this.twilioAuthToken = twilioAuthToken;
+        this.twilioAuthToken  = twilioAuthToken;
 
-        // Language + active Kokoro voice
+        // Language / voice
         this.language = language || 'en';
-        this.voice = voice || null; // null = GPU server uses its language default
+        this.voice    = voice    || null;
 
         // Prompt
         this.systemPrompt = systemPrompt;
 
-        // State
-        this.status = 'connecting';     // connecting | active | ending | ended
-        this.isSpeaking = false;
+        // Lifecycle
+        this.status = 'connecting';   // connecting | active | ending | ended
+
+        // AI speaking / user speaking flags
+        this.isSpeaking   = false;
         this.isAISpeaking = false;
 
-        // Dynamic variables extracted from custom tool responses
+        // Dynamic variables from custom tool responses
         this.dynamicVariables = {};
 
-        // Audio buffer for accumulating speech between VAD events
-        this.speechBuffer = [];
+        // ── FIX: initialize all pipeline state in constructor ─────────────────
+        // Previously these were initialized lazily with patterns like:
+        //   `if (!session.vadAccumulator) session.vadAccumulator = [];`
+        // inside the hot audio path. Lazy init is fragile: if any code path
+        // reads the property before the first write, it gets undefined instead
+        // of the expected empty collection. Move all of it here so every session
+        // starts with a clean, well-typed state.
+
+        // Audio pipeline state
+        this.speechBuffer         = [];   // PCM16 buffers during active speech
+        this.vadAccumulator       = [];   // 20ms chunks accumulating toward 200ms batch
+        this.preRollBuffer        = [];   // last 2 batches (400ms) before speech onset
+
+        // VAD coordination
+        this.vadInFlight          = false;  // true while one VAD HTTP call is pending
+        this.speechStartCount     = 0;      // consecutive speech_start events in current turn
+        this.speechStartedAt      = null;   // Date.now() when current turn started
+        this.transcribeInFlight   = false;  // guards against concurrent STT calls
 
         // Timers
-        this.silenceTimer = null;
-        this.maxDurationTimer = null;
-        this.startTime = Date.now();
+        this.silenceTimer      = null;
+        this.maxDurationTimer  = null;
+        this.startTime         = Date.now();
 
         // References set by pipeline
-        this.openaiClient = null;
-        this.mediaStreamWs = null;
+        this.openaiClient    = null;
+        this.mediaStreamWs   = null;
         this.twilioStreamSid = null;
+        this._twilioClient   = null;  // cached Twilio REST client
     }
 
     appendSpeechBuffer(chunk) {
@@ -61,21 +74,19 @@ class CallSession extends EventEmitter {
 
     flushSpeechBuffer() {
         if (this.speechBuffer.length === 0) return Buffer.alloc(0);
-        const combined = Buffer.concat(this.speechBuffer);
+        const combined    = Buffer.concat(this.speechBuffer);
         this.speechBuffer = [];
         return combined;
     }
 
     startSilenceTimer(onHangup) {
         this.clearSilenceTimer();
-
         const configuredTimeout = this.assistantConfig.silence_timeout_seconds;
         const timeoutMs = (configuredTimeout && configuredTimeout > 0)
             ? configuredTimeout * 1000
             : parseInt(process.env.SILENCE_TIMEOUT_SECONDS || '10') * 1000;
-
         this.silenceTimer = setTimeout(() => {
-            logger.info('Silence timeout - ending call', { callSid: this.callSid });
+            logger.info('Silence timeout — ending call', { callSid: this.callSid });
             onHangup();
         }, timeoutMs);
     }
@@ -88,12 +99,10 @@ class CallSession extends EventEmitter {
     }
 
     startMaxDurationTimer(onExpire) {
-        // Use assistant's max_duration_seconds if set, otherwise .env default
         const configuredMax = this.assistantConfig.max_duration_seconds;
         const maxMs = (configuredMax && configuredMax > 0)
             ? configuredMax * 1000
             : parseInt(process.env.MAX_CALL_DURATION_SECONDS || '900') * 1000;
-
         this.maxDurationTimer = setTimeout(() => {
             logger.info('Max call duration reached', { callSid: this.callSid });
             onExpire();
@@ -119,9 +128,6 @@ class CallSession extends EventEmitter {
     }
 }
 
-/**
- * CallManager - singleton registry of all active call sessions
- */
 class CallManager {
     constructor() {
         this.sessions = new Map();

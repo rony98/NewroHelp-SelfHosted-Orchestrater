@@ -7,36 +7,26 @@ const { buildTools, execute: executeFn } = require('./functions');
 const { twilioMulawToPcm16, pcm16ToBase64Wav, pcm16ToTwilioMulaw, isSilence } = require('../utils/audio');
 const logger                         = require('../utils/logger');
 
-// Sentence boundary detection for TTS chunking.
-//
-// The naive regex /[.!?]+(?:\s|$)/ fires on "Mr. Smith", "3.14", "e.g. this"
-// — all wrong. The improved pattern requires sentence-ending punctuation to be:
-//   (a) followed by whitespace or end of string, AND
-//   (b) either not a single capital-letter abbreviation (Mr/Dr/vs etc.) OR
-//       followed by a lowercase word (unambiguous end).
-//
-// This still isn't perfect for all edge cases — NLTK is the gold standard
-// (what pipecat uses) — but it eliminates the most common false positives
-// from LLM output without adding a dependency.
+// ─── Sentence chunking for TTS ────────────────────────────────────────────────
+// Handles common LLM abbreviation false positives. Not as complete as NLTK
+// (pipecat's approach) but avoids adding a Python dep to Node.js.
 const SENTENCE_RE = /(?<![A-Z][a-z]{0,3}|\d)[.!?]+(?:\s|$)/;
 
-// Twilio sends 20ms mulaw chunks. Accumulate 10 chunks (200ms) per VAD call.
-// Require 2 consecutive speech_start batches (400ms total) before treating
-// as real speech — filters out breathing, background noise, etc.
-const VAD_BATCH_CHUNKS    = 10;
-const INTERRUPT_THRESHOLD = 2;
+// ─── VAD / speech detection constants ────────────────────────────────────────
+const VAD_BATCH_CHUNKS = 10; // 10 × 20ms = 200ms per VAD call
 
-// Keep the last 2 VAD batches (400ms) as a pre-roll buffer.
-// When speech_start fires, prepend this audio so we don't miss the onset
-// of short utterances that began during the preceding "silent" batch.
-const PRE_ROLL_BATCHES = 2;
+// FIX (interrupt threshold 2→1):
+// Old VAD had zero confirmation delay → a cough could instantly fire speech_start →
+//   requiring 2 consecutive events (400ms window) prevented false interruptions.
+// New per-session VAD state machine requires SPEECH_CONFIRM_FRAMES=12 consecutive
+//   speech frames (~192ms) before emitting speech_start. That already provides the
+//   false-positive protection. Keeping threshold=2 would mean 192ms + 400ms =
+//   ~592ms before interrupt — noticeably laggy.
+// With threshold=1: 192ms (VAD confirm) + 200ms (one batch) = ~392ms. Correct.
+const INTERRUPT_THRESHOLD = 1;
 
-// If the user has been speaking for longer than this without a speech_end,
-// force transcription anyway. Prevents missed turns when VAD never cleanly
-// emits speech_end (e.g. background noise keeps the detector hot).
-const MAX_SPEECH_MS = 8000;
-
-
+const PRE_ROLL_BATCHES = 2;    // 2 × 200ms = 400ms pre-roll on speech onset
+const MAX_SPEECH_MS    = 8000; // force transcription if VAD stuck hot
 
 const laravelClient = axios.create({
     baseURL: process.env.LARAVEL_API_URL,
@@ -44,12 +34,6 @@ const laravelClient = axios.create({
     timeout: 10000,
 });
 
-// ─── Twilio REST client ───────────────────────────────────────────────────────
-// Each call may use different Twilio credentials (multi-tenant). We cache the
-// client on the session so it's constructed once per call, not once per REST
-// operation. Without caching, endCall + executeTransferToNumber each call
-// require('twilio')(sid, token) rebuilding the SDK object, validators, and
-// HTTP pools on every API call — wasteful during a 15ms endCall window.
 function getTwilioClient(session) {
     if (!session._twilioClient) {
         const twilio = require('twilio');
@@ -60,7 +44,6 @@ function getTwilioClient(session) {
 
 async function initPipeline(session, mediaStreamWs, pipelineConfig) {
     const { callSid } = session;
-
     logger.info('Initializing pipeline', { callSid });
 
     session.mediaStreamWs = mediaStreamWs;
@@ -70,16 +53,10 @@ async function initPipeline(session, mediaStreamWs, pipelineConfig) {
     const tools = buildTools(session.assistantConfig);
     logger.info(`Loaded ${tools.length} tools`, { callSid, tools: tools.map(t => t.name) });
 
-    // ── Attach message listener BEFORE connecting to OpenAI ──────────────────
-    // The Twilio 'start' event fires as soon as the WebSocket connects.
-    // If we wait until after openaiClient.connect() to attach the listener,
-    // the 'start' event arrives while we're awaiting and is silently dropped,
-    // leaving session.twilioStreamSid undefined and all outbound audio ignored.
-    //
-    // Solution: attach the listener now, buffer 'media' events until the
-    // pipeline is fully ready, then drain the buffer.
-    const mediaQueue = [];
-    let   pipelineReady = false;
+    // Attach message listener BEFORE connecting to OpenAI — the Twilio 'start'
+    // event fires immediately on WS connect, before any await completes.
+    const mediaQueue  = [];
+    let pipelineReady = false;
 
     mediaStreamWs.on('message', async (rawMsg) => {
         let msg;
@@ -87,35 +64,30 @@ async function initPipeline(session, mediaStreamWs, pipelineConfig) {
 
         switch (msg.event) {
             case 'start':
-                // Capture streamSid immediately — cannot be missed
                 session.twilioStreamSid = msg.start.streamSid;
                 logger.info('Stream started', { callSid, streamSid: session.twilioStreamSid });
                 break;
-
             case 'media':
-                if (!pipelineReady) {
-                    mediaQueue.push(msg.media.payload);
-                } else {
-                    await handleIncomingAudio(session, msg.media.payload);
-                }
+                if (!pipelineReady) mediaQueue.push(msg.media.payload);
+                else await handleIncomingAudio(session, msg.media.payload);
                 break;
-
             case 'stop':
                 logger.info('Stream stopped', { callSid });
                 await cleanup(session, 'stream_stopped');
                 break;
-
             case 'mark':
                 if (msg.mark?.name === 'ai_speech_end') {
                     session.isAISpeaking = false;
-                    // AI finished speaking — restart the silence timer so we
-                    // detect if the user goes quiet without responding.
-                    // (The timer was cleared in speakToTwilio to prevent it
-                    // from firing during AI playback.)
                     session.startSilenceTimer(() => endCall(session, 'no_response'));
                 }
                 break;
         }
+    });
+
+    // FIX: 'error' event must be handled — Node.js throws if no listener exists.
+    mediaStreamWs.on('error', (err) => {
+        logger.error('Twilio WS error', { callSid, error: err.message });
+        cleanup(session, 'ws_error');
     });
 
     mediaStreamWs.on('close', () => {
@@ -129,21 +101,18 @@ async function initPipeline(session, mediaStreamWs, pipelineConfig) {
         language: session.language,
     });
 
-    session.openaiClient    = openaiClient;
-    session.ttsBuffer       = '';
+    session.openaiClient     = openaiClient;
+    session.ttsBuffer        = '';
     session.ttsSentenceQueue = Promise.resolve();
 
     await openaiClient.connect();
 
     openaiClient.on('text_delta', (token) => {
         if (!token || session.status === 'ending' || session.status === 'ended') return;
-
         session.ttsBuffer += token;
-
         if (SENTENCE_RE.test(session.ttsBuffer)) {
             const sentence = session.ttsBuffer.trim();
             session.ttsBuffer = '';
-
             session.ttsSentenceQueue = session.ttsSentenceQueue.then(async () => {
                 if (session.status === 'ending' || session.status === 'ended') return;
                 session.transcript.push({ role: 'agent', message: sentence, time_in_call_secs: session.getDurationSeconds() });
@@ -156,10 +125,8 @@ async function initPipeline(session, mediaStreamWs, pipelineConfig) {
     openaiClient.on('text_done', (fullText) => {
         if (!session.ttsBuffer.trim()) return;
         if (session.status === 'ending' || session.status === 'ended') return;
-
         const remainder = session.ttsBuffer.trim();
         session.ttsBuffer = '';
-
         session.ttsSentenceQueue = session.ttsSentenceQueue.then(async () => {
             if (session.status === 'ending' || session.status === 'ended') return;
             session.transcript.push({ role: 'agent', message: remainder, time_in_call_secs: session.getDurationSeconds() });
@@ -179,9 +146,7 @@ async function initPipeline(session, mediaStreamWs, pipelineConfig) {
         }
     });
 
-    openaiClient.on('error', (err) => {
-        logger.error('OpenAI error', { callSid, error: err });
-    });
+    openaiClient.on('error', (err) => logger.error('OpenAI error', { callSid, error: err }));
 
     session.on('end_call_requested',  async (reason)       => endCall(session, reason));
     session.on('voicemail_requested', async ()             => handleVoicemail(session));
@@ -196,19 +161,15 @@ async function initPipeline(session, mediaStreamWs, pipelineConfig) {
     session.startMaxDurationTimer(() => endCall(session, 'max_duration'));
     session.startSilenceTimer(() => endCall(session, 'no_response'));
 
-    // ── Pipeline is ready — drain buffered media and speak first message ───────
     pipelineReady = true;
 
     if (session.assistantConfig.first_message) {
         await speakToTwilio(session, session.assistantConfig.first_message);
     }
 
-    // Drain any media chunks that arrived while OpenAI was connecting
     if (mediaQueue.length > 0) {
         logger.info(`Draining ${mediaQueue.length} buffered audio chunks`, { callSid });
-        for (const payload of mediaQueue) {
-            await handleIncomingAudio(session, payload);
-        }
+        for (const payload of mediaQueue) await handleIncomingAudio(session, payload);
         mediaQueue.length = 0;
     }
 
@@ -218,93 +179,81 @@ async function initPipeline(session, mediaStreamWs, pipelineConfig) {
 function handleIncomingAudio(session, mulawBase64) {
     if (session.status !== 'active') return;
 
-    // Decode and convert this chunk
     const mulawBuf = Buffer.from(mulawBase64, 'base64');
     const pcm16Buf = twilioMulawToPcm16(mulawBuf);
 
-    // Always accumulate into speech buffer when speaking (before VAD fires)
-    // so we don't lose audio during the batching window
-    if (session.isSpeaking) {
-        session.appendSpeechBuffer(pcm16Buf);
-    }
+    // ── FIX: removed chunk-by-chunk speech buffer accumulation ───────────────
+    // The previous code did `if (session.isSpeaking) appendSpeechBuffer(pcm16Buf)`
+    // here for every 20ms chunk, then also added the full 200ms batch inside the
+    // VAD speech_start handler. That caused every batch after the first to be
+    // written twice: 200ms added 10× chunk-by-chunk + once as a batch = 400ms per
+    // 200ms of actual speech. For a 3-batch utterance: 1400ms buffer vs 1000ms
+    // actual — Whisper received 400ms of duplicate audio.
+    //
+    // Fix: accumulate audio ONLY via the VAD handler (batches). To preserve audio
+    // that arrives during the vadInFlight drop window, we capture those batches
+    // explicitly in the guard block below.
 
-    // Accumulate chunks for VAD batching
-    if (!session.vadAccumulator) session.vadAccumulator = [];
     session.vadAccumulator.push(pcm16Buf);
-
-    // Only call VAD once we have enough audio (200ms = 10 x 20ms chunks)
     if (session.vadAccumulator.length < VAD_BATCH_CHUNKS) return;
 
-    // Grab the batch and reset accumulator immediately so next chunks start fresh
-    const batch     = session.vadAccumulator;
-    session.vadAccumulator = [];
-    const batchBuf  = Buffer.concat(batch);
-    const audioB64  = pcm16ToBase64Wav(batchBuf);
+    const batch    = session.vadAccumulator.splice(0);
+    const batchBuf = Buffer.concat(batch);
+    const audioB64 = pcm16ToBase64Wav(batchBuf);
 
-    // Maintain a rolling pre-roll buffer of the last PRE_ROLL_BATCHES batches.
-    // When speech_start fires we prepend this so the onset of the utterance
-    // isn't clipped — critical for short words like "yes", "okay", "no".
-    if (!session.preRollBuffer) session.preRollBuffer = [];
+    // Update rolling pre-roll (last 400ms before speech onset)
     session.preRollBuffer.push(batchBuf);
-    if (session.preRollBuffer.length > PRE_ROLL_BATCHES) {
-        session.preRollBuffer.shift();
-    }
+    if (session.preRollBuffer.length > PRE_ROLL_BATCHES) session.preRollBuffer.shift();
 
-    // ── Silence pre-filter ────────────────────────────────────────────────────
-    // Skip GPU VAD call entirely if the batch is pure silence.
-    // Pipecat uses the same max-amplitude check (threshold = 20) before running
-    // the Silero model. On phone calls silence is the majority of audio time —
-    // before the caller speaks, between turns, hold periods — so this eliminates
-    // most HTTP calls to the GPU server for free.
-    if (isSilence(batchBuf)) return;
+    // ── FIX: silence pre-filter — only skip when NOT tracking speech ─────────
+    // Previous: `if (isSilence(batchBuf)) return;`
+    // Problem: the new vad.py state machine needs SPEECH_END_FRAMES=12 consecutive
+    // silent batches to confirm speech_end. Skipping silent batches during active
+    // speech (isSpeaking=true) prevented stop_count from incrementing → speech_end
+    // never fired → buffer grew 8 seconds every turn.
+    if (isSilence(batchBuf) && !session.isSpeaking) return;
 
     // ── VAD in-flight guard ───────────────────────────────────────────────────
-    // Allow only one pending VAD request per call at a time (serialized).
-    // Without this, if the GPU is under load a backlog of concurrent requests
-    // can build up and resolve out of order, causing stale speech_end events
-    // that flush the buffer prematurely or trigger double transcriptions.
-    // Pipecat enforces this via ThreadPoolExecutor(max_workers=1) per stream.
-    if (session.vadInFlight) return;
+    // One pending VAD request per call at a time (pipecat uses max_workers=1).
+    // FIX: if speaking, capture the dropped batch so speech is gapless for Whisper.
+    if (session.vadInFlight) {
+        if (session.isSpeaking) session.appendSpeechBuffer(batchBuf);
+        return;
+    }
     session.vadInFlight = true;
 
     gpuClient.detectVAD(audioB64, session.callSid).then(async (vadResult) => {
         if (session.status !== 'active') return;
-
         const { event } = vadResult;
 
         if (event === 'speech_start') {
-            session.speechStartCount = (session.speechStartCount || 0) + 1;
+            session.speechStartCount++;
 
             if (!session.isSpeaking) {
                 session.isSpeaking      = true;
                 session.speechStartedAt = Date.now();
                 session.clearSilenceTimer();
-
-                // Prepend pre-roll so we capture the onset of this utterance.
-                // The pre-roll contains the batches just before speech_start
-                // fired, including any partial speech at the tail of "silence".
-                if (session.preRollBuffer?.length > 0) {
-                    const preRoll = Buffer.concat(session.preRollBuffer);
-                    session.appendSpeechBuffer(preRoll);
+                // Pre-roll: audio from before speech_start so short words aren't clipped
+                if (session.preRollBuffer.length > 0) {
+                    session.appendSpeechBuffer(Buffer.concat(session.preRollBuffer));
                 }
+                session.appendSpeechBuffer(batchBuf);  // first batch
+            } else {
+                // Each subsequent batch is added here exactly once.
+                // (Not at the top of handleIncomingAudio — that was the double-write.)
+                session.appendSpeechBuffer(batchBuf);
             }
-            session.appendSpeechBuffer(batchBuf);
 
-            // Only interrupt the AI after INTERRUPT_THRESHOLD consecutive detections
-            // — prevents breathing/noise from cutting off AI speech
             if (session.speechStartCount >= INTERRUPT_THRESHOLD && session.isAISpeaking) {
                 interruptAI(session);
             }
 
-            // Force transcription if the user has been "speaking" too long
-            // without a speech_end. This fires when VAD stays hot due to
-            // background noise, echo, or a very long utterance.
             if (session.speechStartedAt && (Date.now() - session.speechStartedAt) > MAX_SPEECH_MS) {
                 logger.warn('Max speech duration reached — forcing transcription', { callSid: session.callSid });
+                const speechAudio = session.flushSpeechBuffer();
                 session.isSpeaking       = false;
                 session.speechStartedAt  = null;
                 session.speechStartCount = 0;
-                const speechAudio = session.flushSpeechBuffer();
                 if (speechAudio.length > 0) await transcribeAndRespond(session, speechAudio);
             }
 
@@ -319,6 +268,7 @@ function handleIncomingAudio(session, mulawBase64) {
             if (speechAudio.length > 0) await transcribeAndRespond(session, speechAudio);
             session.startSilenceTimer(() => endCall(session, 'no_response'));
         }
+
     }).catch(() => {}).finally(() => {
         session.vadInFlight = false;
     });
@@ -327,14 +277,13 @@ function handleIncomingAudio(session, mulawBase64) {
 async function transcribeAndRespond(session, pcm16Buffer) {
     const { callSid } = session;
 
+    // Guard against concurrent transcriptions
+    if (session.transcribeInFlight) return;
+    session.transcribeInFlight = true;
+
     let transcript;
     try {
         const audioB64 = pcm16ToBase64Wav(pcm16Buffer);
-        // Use /stt/transcribe rather than /process/audio.
-        // We only call this function at speech_end — VAD has already determined
-        // this is speech. /process/audio runs the Silero model again on the full
-        // buffer (needlessly, ~20–50ms of wasted GPU time), then runs Whisper.
-        // /stt/transcribe skips the VAD pass and goes directly to Whisper.
         const { data } = await axios.post(
             `${process.env.GPU_SERVER_URL}/stt/transcribe`,
             { audio: audioB64, language: session.language, sample_rate: 16000 },
@@ -344,6 +293,8 @@ async function transcribeAndRespond(session, pcm16Buffer) {
     } catch (err) {
         logger.error('STT failed', { callSid, error: err.message });
         return;
+    } finally {
+        session.transcribeInFlight = false;
     }
 
     if (!transcript) return;
@@ -361,19 +312,14 @@ async function transcribeAndRespond(session, pcm16Buffer) {
 async function speakToTwilio(session, text) {
     const { callSid } = session;
 
-    // Pause the silence timer while the AI is speaking.
-    // Without this, the silence timer (which counts down from the last user
-    // utterance) can fire mid-response and terminate the call — particularly
-    // dangerous for short silence timeouts with long AI responses.
-    // The timer is restarted when Twilio confirms AI speech is done (mark event).
+    // Skip empty/whitespace (LLM can return whitespace-only deltas)
+    if (!text || !text.trim()) return;
+
     session.clearSilenceTimer();
     session.isAISpeaking = true;
 
     try {
         const ttsStart = Date.now();
-
-        // Step 1: make the request — responseType:'stream' resolves as soon as
-        // response headers arrive, before any body data flows
         let response;
         try {
             response = await axios({
@@ -384,8 +330,6 @@ async function speakToTwilio(session, text) {
                 responseType: 'stream',
                 timeout:      15000,
             });
-            // GPU server resamples Kokoro 24kHz → 8kHz via soxr before streaming.
-            // X-Sample-Rate will always be 8000. Node.js just mulaw-encodes directly.
             logger.info(`TTS response headers received — status: ${response.status}`, { callSid });
         } catch (err) {
             logger.error(`TTS axios error: ${err.message}`, { callSid });
@@ -393,28 +337,15 @@ async function speakToTwilio(session, text) {
             return;
         }
 
-        // Step 2: consume the stream
         await new Promise((resolve, reject) => {
-            // Accumulate incoming data as a list of chunks, slice off 320-byte
-            // Twilio frames as they become available.
-            //
-            // Previous pattern: pcmBuffer = Buffer.concat([pcmBuffer, chunk])
-            // on every data event. Each call copies the entire existing buffer
-            // into a new allocation — O(n²) over the life of the stream.
-            //
-            // New pattern: push chunks into an array, track total bytes, only
-            // concat when we have enough for a complete Twilio frame. GC sees
-            // at most one allocation per 320-byte output frame instead of one
-            // per incoming network packet.
-            const TWILIO_FRAME = 320; // 160 samples × 2 bytes = 20ms at 8kHz
-            const chunks       = [];
-            let   totalBytes   = 0;
+            const TWILIO_FRAME  = 320;
+            const chunks        = [];
+            let   totalBytes    = 0;
             let   bytesReceived = 0;
 
             const flushFrames = (ws, streamSid) => {
                 while (totalBytes >= TWILIO_FRAME) {
-                    // Assemble exactly one frame from the chunk list
-                    const frame = Buffer.allocUnsafe(TWILIO_FRAME);
+                    const frame    = Buffer.allocUnsafe(TWILIO_FRAME);
                     let   framePos = 0;
                     while (framePos < TWILIO_FRAME) {
                         const head = chunks[0];
@@ -434,19 +365,17 @@ async function speakToTwilio(session, text) {
                     const mulawSlice = pcm16ToTwilioMulaw(frame);
                     if (ws?.readyState === 1) {
                         ws.send(JSON.stringify({
-                            event:     'media',
-                            streamSid,
-                            media:     { payload: mulawSlice.toString('base64') },
+                            event: 'media', streamSid,
+                            media: { payload: mulawSlice.toString('base64') },
                         }));
                     }
                 }
             };
 
-            // Safety net: if stream goes silent for 10s, bail out
             let streamTimer = setTimeout(() => {
                 logger.error(`TTS stream timeout after ${bytesReceived} bytes received`, { callSid });
                 response.data.destroy();
-                resolve(); // resolve not reject — partial audio is fine
+                resolve();
             }, 10000);
 
             const done = (reason) => {
@@ -458,7 +387,7 @@ async function speakToTwilio(session, text) {
             response.data.on('data', (chunk) => {
                 clearTimeout(streamTimer);
                 streamTimer = setTimeout(() => {
-                    logger.error(`TTS stream stalled mid-stream after ${bytesReceived} bytes`, { callSid });
+                    logger.error(`TTS stream stalled after ${bytesReceived} bytes`, { callSid });
                     response.data.destroy();
                     resolve();
                 }, 10000);
@@ -482,27 +411,22 @@ async function speakToTwilio(session, text) {
             });
 
             response.data.on('end', () => {
-                // Flush any remaining bytes (< 320) as a final partial frame
                 if (totalBytes > 0) {
                     const remainder = Buffer.concat(chunks.splice(0), totalBytes);
                     if (remainder.length >= 2 && session.mediaStreamWs?.readyState === 1) {
                         const mulawSlice = pcm16ToTwilioMulaw(remainder);
                         session.mediaStreamWs.send(JSON.stringify({
-                            event:     'media',
-                            streamSid: session.twilioStreamSid,
-                            media:     { payload: mulawSlice.toString('base64') },
+                            event: 'media', streamSid: session.twilioStreamSid,
+                            media: { payload: mulawSlice.toString('base64') },
                         }));
                     }
                 }
-
                 if (session.mediaStreamWs?.readyState === 1) {
                     session.mediaStreamWs.send(JSON.stringify({
-                        event:     'mark',
-                        streamSid: session.twilioStreamSid,
-                        mark:      { name: 'ai_speech_end' },
+                        event: 'mark', streamSid: session.twilioStreamSid,
+                        mark:  { name: 'ai_speech_end' },
                     }));
                 }
-
                 done('ended');
             });
 
@@ -524,46 +448,31 @@ function interruptAI(session) {
     logger.info('User interrupted AI', { callSid: session.callSid });
     if (session.openaiClient) session.openaiClient.cancelResponse();
     if (session.mediaStreamWs?.readyState === 1) {
-        session.mediaStreamWs.send(JSON.stringify({
-            event:     'clear',
-            streamSid: session.twilioStreamSid,
-        }));
+        session.mediaStreamWs.send(JSON.stringify({ event: 'clear', streamSid: session.twilioStreamSid }));
     }
-    session.isAISpeaking    = false;
-    session.ttsBuffer       = '';
-    session.preRollBuffer   = [];
-
-    // Reset the sentence queue so already-queued sentences don't play after
-    // the interrupt. Without this, any sentences that were chained onto
-    // ttsSentenceQueue before the interrupt fire complete after the Twilio
-    // 'clear' event, making it sound like the AI ignored the interruption.
+    session.isAISpeaking     = false;
+    session.ttsBuffer        = '';
+    session.preRollBuffer    = [];
+    // Reset queue so already-queued sentences don't play after the interrupt
     session.ttsSentenceQueue = Promise.resolve();
 }
 
 async function handleVoicemail(session) {
-    const { callSid } = session;
-    logger.info('Voicemail detected', { callSid });
-
+    logger.info('Voicemail detected', { callSid: session.callSid });
     const message = session.assistantConfig.voicemail_message;
-    if (message) {
-        await speakToTwilio(session, message);
-    }
-
+    if (message) await speakToTwilio(session, message);
     await endCall(session, 'voicemail_detected');
 }
 
 async function endCall(session, reason) {
-    const { callSid } = session;
     if (session.status === 'ending' || session.status === 'ended') return;
-
     session.status = 'ending';
-    logger.info(`Ending call: ${reason}`, { callSid });
-
+    logger.info(`Ending call: ${reason}`, { callSid: session.callSid });
     try {
         const twilio = getTwilioClient(session);
-        await twilio.calls(callSid).update({ status: 'completed' });
+        await twilio.calls(session.callSid).update({ status: 'completed' });
     } catch (err) {
-        logger.error('Twilio hangup failed', { callSid, error: err.message });
+        logger.error('Twilio hangup failed', { callSid: session.callSid, error: err.message });
     } finally {
         await cleanup(session, reason);
     }
@@ -572,17 +481,14 @@ async function endCall(session, reason) {
 async function executeTransferToNumber(session, transferData) {
     const { callSid } = session;
     logger.info(`Transferring to number: ${transferData.phone_number}`, { callSid });
-
     try {
         if (transferData.enable_client_message && transferData.transfer_message) {
             await speakToTwilio(session, transferData.transfer_message);
         }
-
         const twilio = getTwilioClient(session);
         const twiml  = transferData.transfer_type === 'sip_refer'
             ? `<Response><Dial><Sip>${transferData.phone_number}</Sip></Dial></Response>`
             : `<Response><Dial><Number>${transferData.phone_number}</Number></Dial></Response>`;
-
         await twilio.calls(callSid).update({ twiml });
         await cleanup(session, 'transferred_to_number');
     } catch (err) {
@@ -593,16 +499,13 @@ async function executeTransferToNumber(session, transferData) {
 async function executeTransferToAgent(session, transferData) {
     const { callSid } = session;
     logger.info(`Transferring to agent: ${transferData.agent_id}`, { callSid });
-
     try {
         if (transferData.enable_client_message && transferData.transfer_message) {
             await speakToTwilio(session, transferData.transfer_message);
         }
-
         const { data } = await laravelClient.get(`/calls/${callSid}/transfer-agent`, {
             params: { agent_id: transferData.agent_id },
         });
-
         const twilio = getTwilioClient(session);
         await twilio.calls(callSid).update({ url: data.twiml_url });
         await cleanup(session, 'transferred_to_agent');
@@ -613,25 +516,18 @@ async function executeTransferToAgent(session, transferData) {
 
 async function cleanup(session, reason = 'completed') {
     if (session.status === 'ended') return;
-
     const { callSid } = session;
     session.end(reason);
-
     if (session.openaiClient) session.openaiClient.disconnect();
-
     try { await gpuClient.resetVAD(callSid); } catch {}
-
     await postCallComplete(session, reason);
-
     const { callManager } = require('./callmanager');
     callManager.remove(callSid);
-
     logger.info('Pipeline cleaned up', { callSid, reason });
 }
 
 async function postCallComplete(session, endReason) {
     const { callSid } = session;
-
     try {
         await laravelClient.post(`/calls/${callSid}/complete`, {
             call_sid:          callSid,
@@ -643,7 +539,6 @@ async function postCallComplete(session, endReason) {
             transcript:        session.transcript || [],
             dynamic_variables: session.dynamicVariables || {},
         });
-
         logger.info('Post-call data sent to Laravel', { callSid });
     } catch (err) {
         logger.error('Failed to POST call complete to Laravel', { callSid, error: err.message });
