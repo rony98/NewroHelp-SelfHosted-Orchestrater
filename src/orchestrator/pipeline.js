@@ -27,7 +27,10 @@ const VAD_BATCH_CHUNKS = 10; // 10 × 20ms = 200ms per VAD call
 const INTERRUPT_THRESHOLD = 1;
 
 const PRE_ROLL_BATCHES = 2;    // 2 × 200ms = 400ms pre-roll on speech onset
-const MAX_SPEECH_MS    = 8000; // force transcription if VAD stuck hot
+const MAX_SPEECH_MS    = 20000; // force transcription if VAD stuck hot
+// 20s covers any realistic utterance (orders, addresses,
+// long questions). 8s was too short — callers giving
+// a restaurant order or phone number exceed it naturally.
 
 // ─── Minimum speech duration gate (pipecat: minimum_speech_duration) ─────────
 // Ignore utterances shorter than this threshold. Coughs, breathing, and brief
@@ -38,7 +41,9 @@ const MIN_SPEECH_MS = 200;
 // ─── Smart Turn fallback timer ────────────────────────────────────────────────
 // If Smart Turn says "incomplete" and no new speech arrives within this window,
 // force transcription anyway. Matches pipecat's VADParams stop_secs fallback.
-const TURN_FALLBACK_MS = 2000;
+// 800ms: long enough for a genuine mid-sentence pause, short enough not to feel
+// like a dead line. (Previous value of 2000ms was too jarring.)
+const TURN_FALLBACK_MS = 800;
 
 // ─── Context summarization ────────────────────────────────────────────────────
 // When the transcript exceeds this word count, summarize and trim the OpenAI
@@ -283,7 +288,9 @@ function handleIncomingAudio(session, mulawBase64) {
     // silent batches to confirm speech_end. Skipping silent batches during active
     // speech (isSpeaking=true) prevented stop_count from incrementing → speech_end
     // never fired → buffer grew 8 seconds every turn.
-    if (isSilence(batchBuf) && !session.isSpeaking) return;
+    // Also pass through during awaitingTurnConfirmation so VAD can detect if the
+    // user starts speaking again during the Smart Turn hold window.
+    if (isSilence(batchBuf) && !session.isSpeaking && !session.awaitingTurnConfirmation) return;
 
     // ── VAD in-flight guard ───────────────────────────────────────────────────
     // One pending VAD request per call at a time (pipecat uses max_workers=1).
@@ -301,35 +308,60 @@ function handleIncomingAudio(session, mulawBase64) {
         if (event === 'speech_start') {
             session.speechStartCount++;
 
-            if (!session.isSpeaking) {
+            if (session.awaitingTurnConfirmation) {
+                // ── Smart Turn hold: user continued speaking ──────────────────
+                // User spoke again after Smart Turn said "incomplete". Cancel the
+                // fallback timer — we'll wait for the next speech_end and re-evaluate
+                // the full accumulated buffer (previous segment + new speech).
+                if (session.turnConfirmationTimer) {
+                    clearTimeout(session.turnConfirmationTimer);
+                    session.turnConfirmationTimer = null;
+                }
+                // Start tracking this new segment with a FRESH speechStartedAt.
+                // FIX: Never backdate speechStartedAt — that caused MAX_SPEECH_MS
+                // to fire 8 seconds after the original turn start rather than
+                // 8 seconds of genuine continuous speech.
+                if (!session.isSpeaking) {
+                    session.isSpeaking      = true;
+                    session.speechStartedAt = Date.now();
+                    session.clearSilenceTimer();
+                }
+                session.appendSpeechBuffer(batchBuf);
+
+            } else if (!session.isSpeaking) {
+                // ── Normal new turn start ─────────────────────────────────────
                 session.isSpeaking      = true;
                 session.speechStartedAt = Date.now();
                 session.clearSilenceTimer();
 
                 // ── STT mute: note if speech started while AI was playing ─────
-                // If the AI finishes before the user accumulates INTERRUPT_THRESHOLD
-                // speech events, this audio is likely the AI's echo or ambient
-                // background — not a real user utterance. Flag it for discard.
-                // (pipecat: STTMuteFilter behavior)
                 session.speechStartedDuringAI = session.isAISpeaking;
 
-                // Pre-roll: audio from before speech_start so short words aren't clipped
+                // Pre-roll: capture audio just before speech_start so the first
+                // word isn't clipped (VAD needs 12 frames to confirm)
                 if (session.preRollBuffer.length > 0) {
                     session.appendSpeechBuffer(Buffer.concat(session.preRollBuffer));
                 }
-                session.appendSpeechBuffer(batchBuf);  // first batch
+                session.appendSpeechBuffer(batchBuf);
+
             } else {
+                // ── Continuing existing turn ──────────────────────────────────
                 session.appendSpeechBuffer(batchBuf);
             }
 
             if (session.speechStartCount >= INTERRUPT_THRESHOLD && session.isAISpeaking) {
-                // User has accumulated enough speech events to be a real interruption.
-                // Clear the mute flag — this is definitely intentional speech.
+                // Real interruption — clear the mute flag and interrupt AI
                 session.speechStartedDuringAI = false;
                 interruptAI(session);
             }
 
-            if (session.speechStartedAt && (Date.now() - session.speechStartedAt) > MAX_SPEECH_MS) {
+            // MAX_SPEECH_MS: force transcription if a single segment runs too long.
+            // Only check when actively speaking — NOT during the awaitingTurnConfirmation
+            // pause between segments (where isSpeaking may be false and speechStartedAt
+            // reflects only the current sub-segment, not the full call).
+            if (!session.awaitingTurnConfirmation &&
+                session.speechStartedAt &&
+                (Date.now() - session.speechStartedAt) > MAX_SPEECH_MS) {
                 logger.warn('Max speech duration reached — forcing transcription', { callSid: session.callSid });
                 const speechAudio = session.flushSpeechBuffer();
                 session.isSpeaking              = false;
@@ -355,6 +387,12 @@ function handleIncomingAudio(session, mulawBase64) {
             }
 
         } else if (event === 'speech_end') {
+            // isConfirmationContinuation: true when this speech_end closes a segment
+            // started after Smart Turn held the previous buffer as incomplete.
+            // Used to skip min-speech / STT-mute gates that would wrongly discard
+            // a short continuation of an already-established turn.
+            const isConfirmationContinuation = session.awaitingTurnConfirmation;
+
             const speechDurationMs = session.speechStartedAt
                 ? Date.now() - session.speechStartedAt
                 : 0;
@@ -367,54 +405,41 @@ function handleIncomingAudio(session, mulawBase64) {
             session.speechStartedAt  = null;
 
             // ── Minimum speech duration gate ──────────────────────────────────
-            // Discard utterances shorter than MIN_SPEECH_MS (200ms). Coughs,
-            // breathing, and brief noise bursts that survive RNNoise + VAD are
-            // typically <100ms. Sending them to Whisper wastes GPU cycles and
-            // produces hallucinated transcriptions.
-            // (pipecat: VADParams minimum_speech_duration parameter)
-            if (speechDurationMs < MIN_SPEECH_MS) {
+            // Skip for continuation turns — the accumulated buffer is already
+            // substantial; the new segment only needs to be non-empty.
+            if (!isConfirmationContinuation && speechDurationMs < MIN_SPEECH_MS) {
                 logger.debug(
                     `Speech too short (${speechDurationMs}ms < ${MIN_SPEECH_MS}ms) — discarding`,
                     { callSid: session.callSid }
                 );
-                session.speechStartedDuringAI = false;
+                session.speechStartedDuringAI    = false;
+                session.awaitingTurnConfirmation = false;
                 session.startSilenceTimer(() => endCall(session, 'no_response'));
                 return;
             }
 
             // ── STT mute during AI speaking ───────────────────────────────────
-            // If speech started while AI was playing AND the user never
-            // accumulated enough events to trigger an interruption, this is
-            // almost certainly the AI's echo, hold music bleed, or background
-            // noise — not real user speech. Discard silently.
-            // (pipecat: STTMuteFilter)
-            if (session.speechStartedDuringAI && session.speechStartCount < INTERRUPT_THRESHOLD) {
+            // Skip for continuation turns — intent is already established.
+            if (!isConfirmationContinuation &&
+                session.speechStartedDuringAI &&
+                session.speechStartCount < INTERRUPT_THRESHOLD) {
                 logger.debug('Speech during AI playback below interrupt threshold — discarding (echo/background)', {
                     callSid: session.callSid,
                 });
-                session.speechStartedDuringAI = false;
+                session.speechStartedDuringAI    = false;
+                session.awaitingTurnConfirmation  = false;
                 session.startSilenceTimer(() => endCall(session, 'no_response'));
                 return;
             }
             session.speechStartedDuringAI = false;
 
             if (speechAudio.length === 0) {
+                session.awaitingTurnConfirmation = false;
                 session.startSilenceTimer(() => endCall(session, 'no_response'));
                 return;
             }
 
             // ── Smart Turn Detection ──────────────────────────────────────────
-            // Ask the Smart Turn v3 model whether the user has finished their
-            // turn or paused mid-sentence ("My phone number is, um...").
-            // (pipecat: LocalSmartTurnAnalyzerV3 / TurnAnalyzerUserTurnStopStrategy)
-            //
-            // If incomplete: hold the audio buffer for up to TURN_FALLBACK_MS
-            // for the user to continue. If they do, VAD will accumulate new
-            // speech into the session normally. When VAD fires speech_end again,
-            // Smart Turn re-evaluates the full buffer (now longer).
-            // If they don't continue: the fallback timer fires and transcribes.
-            //
-            // If complete (or model unavailable): proceed to transcribe immediately.
             const audioB64ForTurn = pcm16ToBase64Wav(speechAudio);
             const turnResult      = await checkTurnComplete(audioB64ForTurn);
 
@@ -424,39 +449,51 @@ function handleIncomingAudio(session, mulawBase64) {
                     { callSid: session.callSid }
                 );
 
-                // Restore buffer so the next speech_start can append to it
-                session.appendSpeechBuffer(speechAudio);
-                session.isSpeaking               = true;
-                session.speechStartedAt          = Date.now() - speechDurationMs;
-                session.awaitingTurnConfirmation  = true;
+                // FIX: Always cancel the existing timer before creating a new one.
+                // Without this, every speech_end during confirmation stacked another
+                // timer, causing double-transcription races and the 8-second delay.
+                if (session.turnConfirmationTimer) {
+                    clearTimeout(session.turnConfirmationTimer);
+                    session.turnConfirmationTimer = null;
+                }
 
-                // Fallback timer: if no new speech in TURN_FALLBACK_MS, transcribe anyway.
-                // Prevents indefinite waiting if the model was wrong about incompleteness.
+                // Keep audio in the speech buffer for when the user continues.
+                // The speech_start handler will append new audio to this buffer.
+                //
+                // FIX: Do NOT restore isSpeaking=true or backdate speechStartedAt.
+                // Previously: isSpeaking=true + speechStartedAt=Date.now()-speechDurationMs
+                // caused MAX_SPEECH_MS to fire 8 seconds after the ORIGINAL turn start
+                // rather than 8 seconds of genuine continuous speech. The user saying
+                // "Hey how are you?" twice took ~5s total but MAX_SPEECH_MS=8000 fired
+                // because speechStartedAt was backdated to the very first word.
+                // Now: leave isSpeaking=false and speechStartedAt=null. The next
+                // speech_start event will set a fresh speechStartedAt correctly.
+                session.appendSpeechBuffer(speechAudio);
+                session.awaitingTurnConfirmation = true;
+
+                // Fallback: if no new speech arrives, transcribe what we have.
                 session.turnConfirmationTimer = setTimeout(async () => {
                     if (!session.awaitingTurnConfirmation) return;
                     logger.info('Smart Turn fallback timer fired — forcing transcription', { callSid: session.callSid });
                     session.awaitingTurnConfirmation = false;
                     session.turnConfirmationTimer    = null;
                     const audio = session.flushSpeechBuffer();
-                    session.isSpeaking       = false;
-                    session.speechStartedAt  = null;
-                    session.speechStartCount = 0;
                     if (audio.length > 0) await transcribeAndRespond(session, audio);
                     session.startSilenceTimer(() => endCall(session, 'no_response'));
                 }, TURN_FALLBACK_MS);
 
             } else {
-                // Turn is complete — clear any pending confirmation state and transcribe
+                logger.info(
+                    `Smart Turn: COMPLETE (confidence=${turnResult.confidence?.toFixed(3)}) — transcribing ${speechDurationMs}ms`,
+                    { callSid: session.callSid }
+                );
+
+                // FIX: Cancel any pending confirmation timer from a prior incomplete.
                 if (session.turnConfirmationTimer) {
                     clearTimeout(session.turnConfirmationTimer);
                     session.turnConfirmationTimer = null;
                 }
                 session.awaitingTurnConfirmation = false;
-
-                logger.info(
-                    `Smart Turn: COMPLETE (confidence=${turnResult.confidence?.toFixed(3)}) — transcribing ${speechDurationMs}ms`,
-                    { callSid: session.callSid }
-                );
 
                 await transcribeAndRespond(session, speechAudio);
                 session.startSilenceTimer(() => endCall(session, 'no_response'));
