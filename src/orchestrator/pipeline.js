@@ -8,6 +8,14 @@ const { buildTools, execute: executeFn } = require('./functions');
 const { twilioMulawToPcm16, pcm16ToBase64Wav, pcm16ToTwilioMulaw, isSilence } = require('../utils/audio');
 const logger                         = require('../utils/logger');
 
+// ─── Fast interrupt threshold ─────────────────────────────────────────────────
+// When AI is speaking, we bypass the VAD state machine confirmation window and
+// trigger interrupt directly from raw probability. A single 200ms batch with
+// probability >= this threshold is enough to interrupt. Short words ("stop",
+// "wait", "no") register easily at >= 0.6 even over PSTN noise.
+// Only active when session.isAISpeaking=true — no false triggers during silence.
+const FAST_INTERRUPT_PROB = 0.6;
+
 // ─── Sentence chunking for TTS ────────────────────────────────────────────────
 // Handles common LLM abbreviation false positives. Not as complete as NLTK
 // (pipecat's approach) but avoids adding a Python dep to Node.js.
@@ -311,6 +319,31 @@ function handleIncomingAudio(session, mulawBase64) {
         if (session.status !== 'active') return;
         const { event } = vadResult;
 
+        // ── Fast interrupt path ───────────────────────────────────────────────
+        // When AI is speaking, don't wait for SPEECH_CONFIRM_FRAMES (96ms of
+        // consecutive speech frames) before triggering interrupt. Short words
+        // like "stop" or "wait" may not sustain long enough to cross the state
+        // machine threshold. Use raw probability directly: a single 200ms batch
+        // at >= FAST_INTERRUPT_PROB is enough to cut the AI off.
+        //
+        // Reset the counter on any non-speech batch so a single noisy frame
+        // doesn't accumulate across silence gaps.
+        if (session.isAISpeaking) {
+            if (vadResult.probability >= FAST_INTERRUPT_PROB) {
+                session.fastInterruptCount++;
+                if (session.fastInterruptCount >= 1) {
+                    session.fastInterruptCount = 0;
+                    interruptAI(session);
+                    // Don't return — let the normal speech pipeline run so the
+                    // user's audio is captured into the speech buffer for STT.
+                }
+            } else {
+                session.fastInterruptCount = 0;
+            }
+        } else {
+            session.fastInterruptCount = 0;
+        }
+
         if (event === 'speech_start') {
             session.speechStartCount++;
 
@@ -443,38 +476,64 @@ function handleIncomingAudio(session, mulawBase64) {
             }
 
             // ── Smart Turn Detection ──────────────────────────────────────────
-            // Mirrors pipecat TurnAnalyzerUserTurnStopStrategy._handle_vad_user_stopped_speaking():
-            //   state, prediction = await self._turn_analyzer.analyze_end_of_turn()
-            //   self._turn_complete = state == EndOfTurnState.COMPLETE
+            // ── KEY OPTIMIZATION: run Smart Turn and STT in parallel ──────────
+            // Both take the same base64 audio as input. Previously they ran
+            // serially: Smart Turn (~50ms + RTT) then STT (~250ms). Running
+            // concurrently removes ~250ms from perceived response delay every turn.
             //
-            // Called on every speech_end, including during awaitingTurnConfirmation
-            // (when user resumes and pauses again). Smart Turn gets the full
-            // accumulated buffer each time — same as pipecat's audio_buffer which
-            // keeps growing across multiple VAD stop events on INCOMPLETE.
+            // If Smart Turn returns INCOMPLETE, discard the STT result and
+            // preserve the buffer. The cost is one wasted STT call — acceptable.
+            // If COMPLETE, the transcript is already ready with no extra wait.
             const audioB64ForTurn = pcm16ToBase64Wav(speechAudio);
-            const turnResult      = await checkTurnComplete(audioB64ForTurn);
+
+            const [turnResult, sttResultEarly] = await Promise.all([
+                checkTurnComplete(audioB64ForTurn),
+                gpuClient.transcribe(audioB64ForTurn, session.language).catch(err => {
+                    logger.error('Parallel STT failed', { callSid: session.callSid, error: err.message });
+                    return null;
+                }),
+            ]);
 
             if (!turnResult.complete) {
                 logger.info(
                     `Smart Turn: INCOMPLETE (confidence=${turnResult.confidence?.toFixed(3)}) — holding, silence counter at ${session.turnSilenceMs}ms`,
                     { callSid: session.callSid }
                 );
-
-                // Preserve buffer. Silence accumulation continues via 'silence' events.
-                // speech_start resets turnSilenceMs (like pipecat resetting _silence_ms).
-                // No setTimeout — no timer to cancel, no infinite loop.
+                // Preserve buffer. Discard the early STT result — user isn't done.
                 session.appendSpeechBuffer(speechAudio);
                 session.awaitingTurnConfirmation = true;
-                session.turnSilenceMs            = 0;  // reset counter for this new wait
+                session.turnSilenceMs            = 0;
 
             } else {
                 logger.info(
-                    `Smart Turn: COMPLETE (confidence=${turnResult.confidence?.toFixed(3)}) — transcribing ${speechDurationMs}ms`,
+                    `Smart Turn: COMPLETE (confidence=${turnResult.confidence?.toFixed(3)}) — using parallel STT result for ${speechDurationMs}ms`,
                     { callSid: session.callSid }
                 );
                 session.awaitingTurnConfirmation = false;
                 session.turnSilenceMs            = 0;
-                await transcribeAndRespond(session, speechAudio);
+
+                // Use the pre-computed STT result — no additional wait.
+                // Guard against concurrent transcription (e.g. silence fallback fired simultaneously).
+                if (!session.transcribeInFlight && sttResultEarly?.text !== undefined) {
+                    session.transcribeInFlight = true;
+                    try {
+                        const transcript = sttResultEarly.text?.trim();
+                        if (transcript) {
+                            logger.info(`User: "${transcript.slice(0, 100)}"`, { callSid: session.callSid });
+                            session.transcript.push({ role: 'user', message: transcript, time_in_call_secs: session.getDurationSeconds() });
+                            try {
+                                session.openaiClient.sendUserMessage(transcript);
+                            } catch (err) {
+                                logger.error('OpenAI send failed', { callSid: session.callSid, error: err.message });
+                            }
+                        }
+                    } finally {
+                        session.transcribeInFlight = false;
+                    }
+                } else if (!session.transcribeInFlight) {
+                    // Parallel STT failed — fall back to sequential transcription
+                    await transcribeAndRespond(session, speechAudio);
+                }
                 session.startSilenceTimer(() => endCall(session, 'no_response'));
             }
         }

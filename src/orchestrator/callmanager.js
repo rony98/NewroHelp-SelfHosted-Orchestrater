@@ -63,6 +63,14 @@ class CallSession extends EventEmitter {
         // not a real user turn. Discard it instead of sending to Whisper.
         this.speechStartedDuringAI = false;
 
+        // ── Fast interrupt counter (probability-based, bypasses VAD state machine) ──
+        // When AI is speaking, we don't want to wait for SPEECH_CONFIRM_FRAMES (96ms)
+        // before triggering an interrupt. Short words like "stop" or "wait" may not
+        // sustain enough consecutive high-probability frames to cross the state machine
+        // threshold. This counter tracks consecutive 200ms batches with probability
+        // >= FAST_INTERRUPT_PROB_THRESHOLD — only used when isAISpeaking=true.
+        this.fastInterruptCount = 0;
+
         // ── Smart Turn Detection (pipecat: BaseSmartTurn / TurnAnalyzerUserTurnStopStrategy) ──
         // After VAD emits speech_end, Smart Turn model decides if the user finished
         // their turn or paused mid-sentence.
